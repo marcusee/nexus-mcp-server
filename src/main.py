@@ -1,5 +1,6 @@
 # server.py
 import json
+import os
 import re
 import xml.etree.ElementTree as ET
 from pathlib import Path
@@ -136,6 +137,18 @@ def compare(current: str, latest: Optional[str]) -> str:
         return "up_to_date" if current == latest else "unknown"
 
 
+# Optional: restrict which directories can be scanned
+ALLOWED_ROOTS = [os.path.expanduser("~"), "/workspace"]  # adjust as needed
+
+def _is_path_allowed(path: Path) -> bool:
+    resolved = path.resolve()
+    return any(
+        str(resolved).startswith(str(Path(root).resolve()))
+        for root in ALLOWED_ROOTS
+    )
+
+MANIFEST_NAMES = set(PARSERS.keys())  # {"package.json", "requirements.txt", "pom.xml"}
+
 # ---------- MCP Tools ----------
 @mcp.tool()
 async def check_package(name: str, format: str, group: Optional[str] = None) -> dict:
@@ -151,18 +164,37 @@ async def check_package(name: str, format: str, group: Optional[str] = None) -> 
 
 
 @mcp.tool()
-async def scan_manifest(filename: str, content: str) -> dict:
-    """Scan a dependency manifest and report outdated packages.
+async def scan_manifest(
+    filename: str,
+    content: Optional[str] = None,
+    path: Optional[str] = None,
+) -> dict:
+    """Scan a dependency manifest. Provide either `content` (string) or `path` (file on disk).
 
     Args:
-        filename: The manifest filename (package.json, requirements.txt, pom.xml)
-        content: The file contents as a string
+        filename: Manifest filename (package.json, requirements.txt, pom.xml).
+                  Used to pick the parser. If `path` is given, this can be derived from it.
+        content: Raw file contents. Use this when the client has already read the file.
+        path: Absolute path to the manifest file. Use this when the server has FS access.
     """
+    if content is None and path is None:
+        return {"error": "Provide either 'content' or 'path'"}
+
+    if path:
+        p = Path(path)
+        if not _is_path_allowed(p):
+            return {"error": f"Path not in allowed roots: {path}"}
+        if not p.exists():
+            return {"error": f"File not found: {path}"}
+        content = p.read_text(encoding="utf-8")
+        filename = filename or p.name
+
     try:
         deps = detect_and_parse(filename, content)
     except ValueError as e:
         return {"error": str(e)}
 
+    # ... rest of the function stays the same (fetch latest, build summary)
     results = []
     for dep in deps:
         latest = await fetch_latest_version(dep["name"], dep["format"], dep["group"])
@@ -171,7 +203,6 @@ async def scan_manifest(filename: str, content: str) -> dict:
             "latest": latest,
             "status": compare(dep["current"], latest),
         })
-
     summary = {
         "total": len(results),
         "outdated": sum(1 for r in results if r["status"] == "outdated"),
@@ -180,6 +211,51 @@ async def scan_manifest(filename: str, content: str) -> dict:
     }
     return {"manifest": filename, "summary": summary, "dependencies": results}
 
+
+
+@mcp.tool()
+async def scan_project(root: str, recursive: bool = True) -> dict:
+    """Discover and scan all manifest files in a project directory.
+
+    Walks the directory, finds package.json / requirements.txt / pom.xml,
+    and scans each one.
+
+    Args:
+        root: Project root directory (absolute path).
+        recursive: Whether to search subdirectories. Skips node_modules/.venv/etc.
+    """
+    root_path = Path(root)
+    if not _is_path_allowed(root_path):
+        return {"error": f"Path not in allowed roots: {root}"}
+    if not root_path.is_dir():
+        return {"error": f"Not a directory: {root}"}
+
+    SKIP_DIRS = {"node_modules", ".venv", "venv", ".git", "dist", "build", "target"}
+    manifests = []
+
+    if recursive:
+        for dirpath, dirnames, filenames in os.walk(root_path):
+            dirnames[:] = [d for d in dirnames if d not in SKIP_DIRS]
+            for fn in filenames:
+                if fn in MANIFEST_NAMES:
+                    manifests.append(Path(dirpath) / fn)
+    else:
+        manifests = [root_path / n for n in MANIFEST_NAMES if (root_path / n).exists()]
+
+    if not manifests:
+        return {"root": str(root_path), "manifests": [], "message": "No manifests found"}
+
+    scans = []
+    for m in manifests:
+        result = await scan_manifest(filename=m.name, path=str(m))
+        result["path"] = str(m)
+        scans.append(result)
+
+    return {
+        "root": str(root_path),
+        "manifests_found": len(manifests),
+        "scans": scans,
+    }
 
 if __name__ == "__main__":
     mcp.run()
