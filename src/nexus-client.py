@@ -193,6 +193,48 @@ def main():
     for r in sorted(rows, key=lambda x: -(x["threat_level"] or 0)):
         print(f"{r['threat_level']:<7} {r['component']:<60} {r['reason']}")
 
-
+def extract_vulnerabilities(
+    policy_report: dict, raw_report: dict
+) -> list[Vulnerability]:
+    coords_by_hash = {
+        c["hash"]: c.get("componentIdentifier", {})
+        for c in raw_report.get("components", [])
+        if c.get("hash")
+    }
+ 
+    out: list[Vulnerability] = []
+    for comp in policy_report.get("components", []):
+        ident = comp.get("componentIdentifier") or coords_by_hash.get(comp.get("hash"), {})
+        coords = ident.get("coordinates", {}) if ident else {}
+        display = " : ".join(
+            v for v in (
+                coords.get("groupId"),
+                coords.get("artifactId") or coords.get("packageId") or coords.get("name"),
+                coords.get("version"),
+            ) if v
+        ) or comp.get("hash") or "<unknown>"
+ 
+        for violation in comp.get("violations", []):
+            if not _is_security_violation(violation):
+                continue
+            for constraint in violation.get("constraints", []):
+                for cond in constraint.get("conditions", []):
+                    out.append(Vulnerability(
+                        component=display,
+                        policy=violation.get("policyName", ""),
+                        threat_level=violation.get("policyThreatLevel", 0),
+                        reason=cond.get("conditionReason", ""),
+                    ))
+    return out
+ 
+ 
+def _is_security_violation(violation: dict) -> bool:
+    if "Security" in (violation.get("policyName") or ""):
+        return True
+    return any(
+        cond.get("conditionType") == "SecurityVulnerabilitySeverity"
+        for c in violation.get("constraints", [])
+        for cond in c.get("conditions", [])
+        
 if __name__ == "__main__":
     main()
