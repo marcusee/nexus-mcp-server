@@ -1,367 +1,488 @@
-# server.py
-import asyncio
-import json
+"""
+Nexus IQ Remediation MCP Server
+
+Exposes a small set of Nexus IQ endpoints (plus an internal AA-number ->
+GitLab projects lookup) as MCP tools so an LLM can locate scans and
+reason about vulnerabilities for remediation.
+
+Tools:
+  - list_projects_for_aa            -> AA number -> list of GitLab projectIds
+  - find_application_by_public_id   -> GitLab projectId -> IQ internal id
+  - list_reports_for_aa             (chained) AA -> all reports per project
+  - list_reports                    -> /api/v2/reports/applications/{applicationId}
+  - get_report                      -> follow reportDataUrl from list_reports
+  - get_vulnerable_components       (filtered view of the raw report)
+  - get_vulnerability               -> /api/v2/vulnerabilities/{refId}
+
+Typical end-to-end flow (user supplies an AA number, e.g. "AA47794"):
+  Quick path:
+    1. list_reports_for_aa("AA47794")            -> per-project report lists
+    2. get_vulnerable_components(reportDataUrl)  -> compact worklist
+    3. get_vulnerability(refId) for each issue   -> details for remediation
+
+  Step-by-step path (model picks one project to drill into):
+    1. list_projects_for_aa("AA47794")           -> projectIds + URIs
+    2. find_application_by_public_id(projectId)  -> internal applicationId
+    3. list_reports(applicationId)               -> reports for that one app
+    4. get_vulnerable_components(reportDataUrl)
+    5. get_vulnerability(refId)
+
+Auth:
+  - Nexus IQ:        HTTP Basic from NEXUS_IQ_USERNAME / NEXUS_IQ_PASSWORD
+  - AA mapping API:  ungated POST (no credentials sent)
+Environment:
+  NEXUS_IQ_BASE_URL   e.g. https://nexus-iq.example.com
+  NEXUS_IQ_USERNAME   IQ user / token user
+  NEXUS_IQ_PASSWORD   IQ password / user token code
+  RBAC_BASE_URL       Base URL for the AA-mapping API
+                      e.g. ???
+                      (defaults to ???)
+"""
+
+from __future__ import annotations
+
 import os
-import re
-import time
-import tomllib
-import xml.etree.ElementTree as ET
-from pathlib import Path
-from typing import Optional
+from typing import Any
+from urllib.parse import urlparse
 
 import httpx
-from packaging import version as pkg_version
 from mcp.server.fastmcp import FastMCP
 
-mcp = FastMCP("nexus-dep-scanner")
 
-# ---------- Config ----------
-NEXUS_BASE_URL = os.getenv("NEXUS_BASE_URL", "https://your-nexus")
-NEXUS_AUTH = None  # ("user", "pass") if needed
+# ---------------------------------------------------------------------------
+# Config
+# ---------------------------------------------------------------------------
 
-ALLOWED_ROOTS = [os.path.expanduser("~"), "/workspace"]
-SKIP_DIRS = {"node_modules", ".venv", "venv", ".git", "dist", "build", "target", "__pycache__"}
-CONCURRENCY = 10
-CACHE_TTL_SECONDS = 600  # 10 minutes
+BASE_URL = os.environ.get("NEXUS_IQ_BASE_URL", "").rstrip("/")
+USERNAME = os.environ.get("NEXUS_IQ_USERNAME", "")
+PASSWORD = os.environ.get("NEXUS_IQ_PASSWORD", "")
+RBAC_BASE_URL = os.environ.get(
+    "RBAC_BASE_URL", "????"
+).rstrip("/")
 
-# ---------- Cache ----------
-_cache: dict[tuple, tuple[float, Optional[str]]] = {}
-
-def _cache_get(key):
-    entry = _cache.get(key)
-    if not entry:
-        return None
-    ts, val = entry
-    if time.time() - ts > CACHE_TTL_SECONDS:
-        _cache.pop(key, None)
-        return None
-    return val
-
-def _cache_set(key, val):
-    _cache[key] = (time.time(), val)
-
-# ---------- Path safety ----------
-def _is_path_allowed(path: Path) -> bool:
-    resolved = path.resolve()
-    return any(
-        str(resolved).startswith(str(Path(root).resolve()))
-        for root in ALLOWED_ROOTS
+_missing = [
+    name
+    for name, val in (
+        ("NEXUS_IQ_BASE_URL", BASE_URL),
+        ("NEXUS_IQ_USERNAME", USERNAME),
+        ("NEXUS_IQ_PASSWORD", PASSWORD),
+    )
+    if not val
+]
+if _missing:
+    raise RuntimeError(
+        f"Missing required environment variables: {', '.join(_missing)}"
     )
 
-# ---------- Nexus lookup ----------
-async def fetch_latest_version(
-    name: str,
-    fmt: str,
-    group: Optional[str] = None,
-    allow_prerelease: bool = False,
-    client: Optional[httpx.AsyncClient] = None,
-) -> Optional[str]:
-    cache_key = (name.lower(), fmt, (group or "").lower(), allow_prerelease)
-    cached = _cache_get(cache_key)
-    if cached is not None:
-        return cached
+# Hostname of the configured IQ server. Used to defend against the model
+# passing in a fully-qualified URL pointing at some other host.
+_BASE_HOST = urlparse(BASE_URL).netloc
 
-    url = f"{NEXUS_BASE_URL}/service/rest/v1/search"
-    params = {"name": name, "format": fmt, "sort": "version", "direction": "desc"}
-    if group:
-        params["group"] = group
 
-    owns_client = client is None
-    if owns_client:
-        client = httpx.AsyncClient(timeout=30, auth=NEXUS_AUTH)
+# ---------------------------------------------------------------------------
+# HTTP clients
+# ---------------------------------------------------------------------------
 
-    versions = set()
-    try:
-        token = None
-        while True:
-            q = dict(params)
-            if token:
-                q["continuationToken"] = token
-            r = await client.get(url, params=q)
-            r.raise_for_status()
-            data = r.json()
-            for item in data.get("items", []):
-                if item.get("version"):
-                    versions.add(item["version"])
-            token = data.get("continuationToken")
-            if not token:
-                break
-    except Exception:
-        if owns_client:
-            await client.aclose()
-        _cache_set(cache_key, None)
-        return None
-    finally:
-        if owns_client:
-            await client.aclose()
+_iq_client = httpx.Client(
+    base_url=BASE_URL,
+    auth=(USERNAME, PASSWORD),
+    timeout=httpx.Timeout(60.0, connect=10.0),
+    headers={"Accept": "application/json"},
+)
 
-    if not versions:
-        _cache_set(cache_key, None)
-        return None
+# Client for the AA-number -> GitLab projects mapping API.
+# Kept separate from _iq_client so IQ basic-auth is never sent here.
+_aa_mapping_client = httpx.Client(
+    base_url=RBAC_BASE_URL,
+    timeout=httpx.Timeout(30.0, connect=10.0),
+    headers={
+        "Accept": "application/json",
+        "Content-Type": "application/json",
+    },
+)
 
-    def parse(v):
-        try:
-            return pkg_version.parse(v)
-        except Exception:
-            return pkg_version.parse("0")
 
-    sorted_v = sorted(versions, key=parse, reverse=True)
-    result = None
-    if not allow_prerelease:
-        stable = [v for v in sorted_v if not parse(v).is_prerelease]
-        if stable:
-            result = stable[0]
-    if result is None:
-        result = sorted_v[0]
+def _iq_get(path: str, params: dict | None = None) -> Any:
+    """GET a Nexus IQ JSON endpoint, raising on HTTP errors."""
+    resp = _iq_client.get(path, params=params)
+    if resp.status_code == 401:
+        raise RuntimeError(
+            "Nexus IQ rejected credentials (401). "
+            "Check NEXUS_IQ_USERNAME / NEXUS_IQ_PASSWORD."
+        )
+    if resp.status_code == 404:
+        raise RuntimeError(f"Nexus IQ returned 404 for {path}")
+    resp.raise_for_status()
+    return resp.json()
 
-    _cache_set(cache_key, result)
-    return result
 
-# ---------- Helpers ----------
-def clean_version(v: str) -> str:
-    """Strip specifiers like ^, ~, >=, == to get a plain version string."""
-    return re.sub(r"^[\^~><=!\s]+", "", v).split(",")[0].strip()
+def _aa_mapping_post(path: str, json_body: dict) -> Any:
+    """POST to the AA-number -> GitLab projects mapping API."""
+    resp = _aa_mapping_client.post(path, json=json_body)
+    if resp.status_code == 404:
+        raise RuntimeError(f"AA mapping API returned 404 for {path}")
+    resp.raise_for_status()
+    return resp.json()
 
-def parse_pep508(spec: str):
-    """Extract (name, version) from a PEP 508 dep string."""
-    spec = spec.split(";", 1)[0].strip()   # drop env markers
-    spec = spec.split("@", 1)[0].strip()   # drop URL/VCS specs
-    if not spec:
-        return None, ""
-    m = re.match(r"^([A-Za-z0-9_.\-]+)(\[[^\]]*\])?\s*(.*)$", spec)
-    if not m:
-        return None, ""
-    return m.group(1), clean_version(m.group(3) or "")
 
-# ---------- Manifest parsers ----------
-def parse_package_json(content: str):
-    data = json.loads(content)
-    deps = {**data.get("dependencies", {}), **data.get("devDependencies", {})}
-    return [
-        {"name": n, "format": "npm", "group": None, "current": clean_version(v)}
-        for n, v in deps.items()
+def _normalize_report_url(report_data_url: str) -> str:
+    """
+    Accept the reportDataUrl in any of the shapes IQ tends to return it:
+      - relative no-slash:  "api/v2/applications/foo/reports/abc/raw"
+      - relative w/ slash:  "/api/v2/applications/foo/reports/abc/raw"
+      - absolute:           "https://nexus-iq.example.com/api/v2/.../raw"
+
+    Returns a path the configured httpx client can GET. If it's an
+    absolute URL pointing at a different host, refuse — we don't want
+    the model talking us into making requests to arbitrary servers
+    with our basic-auth credentials attached.
+    """
+    if report_data_url.startswith(("http://", "https://")):
+        parsed = urlparse(report_data_url)
+        if parsed.netloc != _BASE_HOST:
+            raise RuntimeError(
+                f"reportDataUrl host {parsed.netloc!r} does not match "
+                f"configured NEXUS_IQ_BASE_URL host {_BASE_HOST!r}."
+            )
+        return parsed.path
+    if not report_data_url.startswith("/"):
+        return "/" + report_data_url
+    return report_data_url
+
+
+# ---------------------------------------------------------------------------
+# MCP server
+# ---------------------------------------------------------------------------
+
+mcp = FastMCP("nexus-iq-remediation")
+
+
+@mcp.tool()
+def list_projects_for_aa(aa_number: str) -> dict:
+    """
+    Look up GitLab projects associated with an AA number via the RBAC API.
+
+    Calls: POST {RBAC_BASE_URL}/api/v1/rbac:findRbacMapping
+           body: {"swc": "<AA number>"}
+
+    Args:
+        aa_number: The AA number / SWC, e.g. "AA47794".
+
+    Returns:
+        {
+          "aa_number": "AA47794",
+          "appdir_id": "ABA834C73B684D03945FCFAC5081A484",
+          "name": "rbac/AA47794/mapping/...",
+          "project_count": 12,
+          "projects": [
+            {"projectId": "271098",
+             "projectUri": "https://devcloud.example.net/.../da-deploy"},
+            ...
+          ]
+        }
+
+        The `projectId` values are what Nexus IQ stores as `publicId`
+        for each application — pass them to find_application_by_public_id.
+
+    Raises:
+        RuntimeError if the AA number maps to zero projects.
+    """
+    payload = _aa_mapping_post(
+        "/api/v1/rbac:findRbacMapping", json_body={"swc": aa_number}
+    )
+
+    projects_raw = payload.get("projects") or []
+    if not projects_raw:
+        raise RuntimeError(
+            f"AA number {aa_number!r} has no GitLab projects in RBAC mapping."
+        )
+
+    # Normalise projectId to a string — IQ publicIds are strings, but the
+    # RBAC API returns them as integers.
+    projects = [
+        {
+            "projectId": str(p.get("projectId")),
+            "projectUri": p.get("projectUri"),
+        }
+        for p in projects_raw
     ]
 
-def parse_requirements_txt(content: str):
-    out = []
-    for line in content.splitlines():
-        line = line.split("#", 1)[0].strip()
-        if not line or line.startswith("-"):
+    return {
+        "aa_number": aa_number,
+        "appdir_id": payload.get("appdirId"),
+        "name": payload.get("name"),
+        "project_count": len(projects),
+        "projects": projects,
+    }
+
+
+@mcp.tool()
+def find_application_by_public_id(public_id: str) -> dict:
+    """
+    Look up a Nexus IQ application by its publicId (a GitLab project ID
+    in this deployment) and return its internal applicationId.
+
+    Calls: GET /api/v2/applications?publicId={publicId}
+
+    This is server-side filtered, NOT a catalog scan, so it stays fast
+    even on instances with tens of thousands of applications.
+
+    Args:
+        public_id: The application's publicId in Nexus IQ. In this
+            deployment that is the GitLab project ID, e.g. "271098".
+
+    Returns:
+        {
+          "id": "f81a5c32544e4d55be8a0d0651dd7145",  # internal id
+          "publicId": "271098",
+          "name": "...",
+          "organizationId": "...",
+          "contactUserName": null | "...",
+          "applicationTags": [...]
+        }
+
+    Raises:
+        RuntimeError if no application matches the publicId (e.g. the
+        GitLab project has never been onboarded to Nexus IQ).
+    """
+    resp = _iq_get("/api/v2/applications", params={"publicId": public_id})
+    apps = resp.get("applications") or []
+    if not apps:
+        raise RuntimeError(
+            f"No Nexus IQ application has publicId={public_id!r}. "
+            f"The project may not be onboarded for scanning."
+        )
+    return apps[0]
+
+
+@mcp.tool()
+def list_reports_for_aa(aa_number: str) -> dict:
+    """
+    Convenience tool: take an AA number, fan out to every associated
+    GitLab project, and return Nexus IQ reports for each.
+
+    Internally chains:
+      1. list_projects_for_aa(aa_number)
+      2. for each project: find_application_by_public_id + list_reports
+
+    Projects that have no IQ application (never onboarded) are reported
+    in `unmapped_projects` rather than failing the whole call. Other
+    per-project errors land in `errors`.
+
+    Args:
+        aa_number: The AA number, e.g. "AA47794".
+
+    Returns:
+        {
+          "aa_number": "AA47794",
+          "project_count": 12,
+          "mapped_count": 9,
+          "results": [
+            {
+              "projectId": "271098",
+              "projectUri": "...",
+              "applicationId": "f81a5c...",
+              "applicationPublicId": "271098",
+              "applicationName": "...",
+              "reports": [ {stage, evaluationDate, reportDataUrl, ...}, ... ]
+            },
+            ...
+          ],
+          "unmapped_projects": [
+            {"projectId": "265215", "projectUri": "...",
+             "reason": "No Nexus IQ application has publicId='265215'."}
+          ],
+          "errors": [
+            {"projectId": "...", "error": "..."}
+          ]
+        }
+    """
+    mapping = list_projects_for_aa(aa_number)
+    projects = mapping["projects"]
+
+    results: list[dict] = []
+    unmapped: list[dict] = []
+    errors: list[dict] = []
+
+    for project in projects:
+        project_id = project["projectId"]
+        try:
+            app = find_application_by_public_id(project_id)
+        except RuntimeError as exc:
+            # Most common case: project not onboarded to IQ.
+            unmapped.append(
+                {
+                    "projectId": project_id,
+                    "projectUri": project["projectUri"],
+                    "reason": str(exc),
+                }
+            )
             continue
-        name, current = parse_pep508(line)
-        if name:
-            out.append({"name": name, "format": "pypi", "group": None, "current": current})
-    return out
-
-def parse_pom_xml(content: str):
-    root = ET.fromstring(content)
-    ns = {"m": "http://maven.apache.org/POM/4.0.0"}
-    namespaced = root.tag.startswith("{")
-    find = lambda el, t: el.find(f"m:{t}", ns) if namespaced else el.find(t)
-    deps = (
-        root.findall(".//m:dependency", ns) if namespaced
-        else root.findall(".//dependency")
-    )
-    out = []
-    for d in deps:
-        g, a, v = find(d, "groupId"), find(d, "artifactId"), find(d, "version")
-        if g is not None and a is not None:
-            out.append({
-                "name": a.text,
-                "format": "maven2",
-                "group": g.text,
-                "current": v.text if v is not None else "",
-            })
-    return out
-
-def parse_pyproject_toml(content: str):
-    data = tomllib.loads(content)
-    out = []
-    seen = set()
-
-    def add(name: str, version: str):
-        key = name.lower()
-        if name and key not in seen:
-            seen.add(key)
-            out.append({
-                "name": name,
-                "format": "pypi",
-                "group": None,
-                "current": clean_version(version or ""),
-            })
-
-    # PEP 621
-    project = data.get("project", {})
-    for dep in project.get("dependencies", []):
-        name, current = parse_pep508(dep)
-        if name:
-            add(name, current)
-    for _g, deps in project.get("optional-dependencies", {}).items():
-        for dep in deps:
-            name, current = parse_pep508(dep)
-            if name:
-                add(name, current)
-
-    # Poetry
-    poetry = data.get("tool", {}).get("poetry", {})
-    for name, spec in poetry.get("dependencies", {}).items():
-        if name.lower() == "python":
+        except httpx.HTTPError as exc:
+            errors.append({"projectId": project_id, "error": str(exc)})
             continue
-        version = spec if isinstance(spec, str) else (spec or {}).get("version", "")
-        add(name, version)
-    for _g, gdata in poetry.get("group", {}).items():
-        for name, spec in (gdata or {}).get("dependencies", {}).items():
-            version = spec if isinstance(spec, str) else (spec or {}).get("version", "")
-            add(name, version)
 
-    return out
+        try:
+            reports = _iq_get(
+                f"/api/v2/reports/applications/{app['id']}"
+            )
+        except (RuntimeError, httpx.HTTPError) as exc:
+            errors.append({"projectId": project_id, "error": str(exc)})
+            continue
 
-PARSERS = {
-    "package.json": parse_package_json,
-    "requirements.txt": parse_requirements_txt,
-    "pom.xml": parse_pom_xml,
-    "pyproject.toml": parse_pyproject_toml,
-}
-MANIFEST_NAMES = set(PARSERS.keys())
-
-def detect_and_parse(filename: str, content: str):
-    parser = PARSERS.get(Path(filename).name)
-    if not parser:
-        raise ValueError(f"Unsupported manifest: {filename}")
-    return parser(content)
-
-# ---------- Version comparison ----------
-def compare(current: str, latest: Optional[str]) -> str:
-    if not latest:
-        return "not_found"
-    if not current:
-        return "unknown"
-    try:
-        c, l = pkg_version.parse(current), pkg_version.parse(latest)
-        if c == l:
-            return "up_to_date"
-        return "outdated" if c < l else "ahead"
-    except Exception:
-        return "up_to_date" if current == latest else "unknown"
-
-# ---------- Concurrent scan ----------
-async def _scan_deps(deps: list[dict]) -> list[dict]:
-    sem = asyncio.Semaphore(CONCURRENCY)
-    async with httpx.AsyncClient(timeout=30, auth=NEXUS_AUTH) as client:
-        async def one(dep):
-            async with sem:
-                latest = await fetch_latest_version(
-                    dep["name"], dep["format"], dep["group"], client=client
-                )
-                return {**dep, "latest": latest, "status": compare(dep["current"], latest)}
-        return await asyncio.gather(*(one(d) for d in deps))
-
-def _summarize(results: list[dict]) -> dict:
-    return {
-        "total": len(results),
-        "outdated": sum(1 for r in results if r["status"] == "outdated"),
-        "up_to_date": sum(1 for r in results if r["status"] == "up_to_date"),
-        "not_found": sum(1 for r in results if r["status"] == "not_found"),
-        "ahead": sum(1 for r in results if r["status"] == "ahead"),
-        "unknown": sum(1 for r in results if r["status"] == "unknown"),
-    }
-
-# ---------- MCP Tools ----------
-@mcp.tool()
-async def check_package(name: str, format: str, group: Optional[str] = None) -> dict:
-    """Check the latest version of a single package in Nexus.
-
-    Args:
-        name: Package name (e.g., 'express', 'requests', 'fastmcp')
-        format: One of 'npm', 'pypi', 'maven2'
-        group: Maven groupId (required for maven2)
-    """
-    latest = await fetch_latest_version(name, format, group)
-    return {"name": name, "format": format, "group": group, "latest": latest}
-
-@mcp.tool()
-async def scan_manifest(
-    filename: Optional[str] = None,
-    content: Optional[str] = None,
-    path: Optional[str] = None,
-) -> dict:
-    """Scan a dependency manifest and report outdated packages.
-
-    Provide either `content` (string) or `path` (file on disk).
-    Supported manifests: package.json, requirements.txt, pom.xml, pyproject.toml.
-
-    Args:
-        filename: Manifest filename. Required if `content` is provided; derived from `path` otherwise.
-        content: Raw file contents.
-        path: Absolute path to the manifest file.
-    """
-    if content is None and path is None:
-        return {"error": "Provide either 'content' or 'path'"}
-
-    if path:
-        p = Path(path)
-        if not _is_path_allowed(p):
-            return {"error": f"Path not in allowed roots: {path}"}
-        if not p.exists():
-            return {"error": f"File not found: {path}"}
-        content = p.read_text(encoding="utf-8")
-        filename = filename or p.name
-
-    if not filename:
-        return {"error": "filename is required when passing 'content'"}
-
-    try:
-        deps = detect_and_parse(filename, content)
-    except ValueError as e:
-        return {"error": str(e)}
-    except Exception as e:
-        return {"error": f"Failed to parse {filename}: {e}"}
-
-    results = await _scan_deps(deps)
-    return {
-        "manifest": filename,
-        "summary": _summarize(results),
-        "dependencies": results,
-    }
-
-@mcp.tool()
-async def scan_project(root: str, recursive: bool = True) -> dict:
-    """Discover and scan all manifest files under a project directory.
-
-    Args:
-        root: Project root directory (absolute path).
-        recursive: Search subdirectories. Skips node_modules, .venv, .git, etc.
-    """
-    root_path = Path(root)
-    if not _is_path_allowed(root_path):
-        return {"error": f"Path not in allowed roots: {root}"}
-    if not root_path.is_dir():
-        return {"error": f"Not a directory: {root}"}
-
-    manifests: list[Path] = []
-    if recursive:
-        for dirpath, dirnames, filenames in os.walk(root_path):
-            dirnames[:] = [d for d in dirnames if d not in SKIP_DIRS]
-            for fn in filenames:
-                if fn in MANIFEST_NAMES:
-                    manifests.append(Path(dirpath) / fn)
-    else:
-        manifests = [root_path / n for n in MANIFEST_NAMES if (root_path / n).exists()]
-
-    if not manifests:
-        return {"root": str(root_path), "manifests": [], "message": "No manifests found"}
-
-    scans = []
-    for m in manifests:
-        result = await scan_manifest(filename=m.name, path=str(m))
-        result["path"] = str(m)
-        scans.append(result)
+        results.append(
+            {
+                "projectId": project_id,
+                "projectUri": project["projectUri"],
+                "applicationId": app["id"],
+                "applicationPublicId": app.get("publicId"),
+                "applicationName": app.get("name"),
+                "reports": reports,
+            }
+        )
 
     return {
-        "root": str(root_path),
-        "manifests_found": len(manifests),
-        "scans": scans,
+        "aa_number": aa_number,
+        "project_count": mapping["project_count"],
+        "mapped_count": len(results),
+        "results": results,
+        "unmapped_projects": unmapped,
+        "errors": errors,
     }
+
+
+@mcp.tool()
+def list_reports(application_id: str) -> list:
+    """
+    List all evaluation reports/scans for one Nexus IQ application.
+
+    Calls: GET /api/v2/reports/applications/{applicationId}
+
+    Args:
+        application_id: The application's INTERNAL id (the `id` field
+            from find_application_by_public_id, e.g.
+            "f81a5c32544e4d55be8a0d0651dd7145"). NOT the publicId.
+
+    Returns:
+        A list of report summaries. Each entry includes a `reportDataUrl`
+        (the path to the raw report) — pass that back into get_report or
+        get_vulnerable_components without parsing out a scan id. Typical
+        entry:
+            {
+              "stage": "build",          # build | stage-release | release | operate | ...
+              "applicationId": "f81a5c...",
+              "evaluationDate": "2026-05-01T10:42:15.212+01:00",
+              "latestReportHtmlUrl": "ui/links/application/.../latestReport/build",
+              "reportHtmlUrl": "ui/links/application/.../report/...",
+              "embeddableReportHtmlUrl": "ui/links/application/.../report/.../embeddable",
+              "reportPdfUrl": "ui/links/application/.../report/.../pdf",
+              "reportDataUrl": "api/v2/applications/.../reports/.../raw"
+            }
+    """
+    return _iq_get(f"/api/v2/reports/applications/{application_id}")
+
+
+@mcp.tool()
+def get_report(report_data_url: str) -> dict:
+    """
+    Fetch the raw scan report by following a reportDataUrl returned from
+    list_reports.
+
+    Args:
+        report_data_url: The `reportDataUrl` field from a list_reports
+            entry. Accepts relative ("api/v2/applications/.../raw") or
+            absolute ("https://nexus-iq.example.com/api/v2/...") forms.
+            Absolute URLs must point at the configured IQ host.
+
+    Returns:
+        The raw report JSON. Components live under `components[]`, each
+        with `securityData.securityIssues[]` whose `reference` field is
+        the refId you pass to get_vulnerability().
+    """
+    return _iq_get(_normalize_report_url(report_data_url))
+
+
+@mcp.tool()
+def get_vulnerable_components(report_data_url: str) -> dict:
+    """
+    Convenience tool: fetch a raw report and return only the components
+    with at least one security issue, alongside the refIds of those issues.
+
+    Use this to get a compact worklist before iterating get_vulnerability()
+    calls, instead of asking the model to scan the full raw report.
+
+    Args:
+        report_data_url: The `reportDataUrl` from a list_reports entry.
+
+    Returns:
+        {
+          "report_data_url": "...",
+          "vulnerable_component_count": 3,
+          "components": [
+            {
+              "packageUrl": "pkg:maven/commons-collections/commons-collections@3.2.2?type=jar",
+              "hash": "...",
+              "componentIdentifier": {...},
+              "issues": [
+                {
+                  "reference": "sonatype-2024-3350",
+                  "severity": 8.7,
+                  "source": "sonatype",
+                  "status": "Open",
+                  "url": "..."
+                }
+              ]
+            }
+          ]
+        }
+    """
+    report = _iq_get(_normalize_report_url(report_data_url))
+
+    vulnerable: list[dict] = []
+    for component in report.get("components", []):
+        sec = component.get("securityData") or {}
+        issues = sec.get("securityIssues") or []
+        if not issues:
+            continue
+        vulnerable.append(
+            {
+                "packageUrl": component.get("packageUrl"),
+                "hash": component.get("hash"),
+                "componentIdentifier": component.get("componentIdentifier"),
+                "issues": issues,
+            }
+        )
+
+    return {
+        "report_data_url": report_data_url,
+        "vulnerable_component_count": len(vulnerable),
+        "components": vulnerable,
+    }
+
+
+@mcp.tool()
+def get_vulnerability(ref_id: str) -> dict:
+    """
+    Fetch details for a single vulnerability by its reference ID.
+
+    Calls: GET /api/v2/vulnerabilities/{refId}
+
+    The returned payload typically contains description / explanation /
+    detection / recommendation Markdown fields, plus CVSS scoring and
+    CWE metadata. The recommendationMarkdown field is the main thing
+    the LLM should use to draft a remediation suggestion.
+
+    Args:
+        ref_id: The vulnerability reference, e.g. "CVE-2021-44228" or
+            "sonatype-2024-3350". This is the `reference` value found
+            inside securityData.securityIssues[] in the scan report.
+    """
+    return _iq_get(f"/api/v2/vulnerabilities/{ref_id}")
+
+
+# ---------------------------------------------------------------------------
+# Entrypoint
+# ---------------------------------------------------------------------------
 
 if __name__ == "__main__":
     mcp.run()
