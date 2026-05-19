@@ -3,7 +3,7 @@ from __future__ import annotions
 import os
 import re
 from datetime import datetime
-from typing import any
+from typing import Any
 from urllib.parse import urlparse
 
 import httpx
@@ -21,6 +21,7 @@ PASSWORD = os.environ.get("NEXUS_IQ_PASSWORD", "")
 RBAC_BASE_URL = os.environ.get(
     "RBAC_BASE_URL", "????"
 ).rstrip("/")
+NEXUS_REPO_BASE_URL = os.environ.get("NEXUS_REPO_BASE_URL", "").rstrip("/")
 
 _missing = [
     name
@@ -64,6 +65,13 @@ _aa_mapping_client = httpx.Client(
     },
     verify=""
 )
+
+# Client for the Nexus Repository Manager search API (no auth).
+_nexus_repo_client = httpx.Client(
+    base_url=NEXUS_REPO_BASE_URL,
+    timeout=httpx.Timeout(30.0, connect=10.0),
+    headers={"Accept": "application/json"},
+) if NEXUS_REPO_BASE_URL else None
 
 
 def _iq_get(path: str, params: dict | None = None) -> Any:
@@ -202,7 +210,6 @@ def _get_sorted_reports(application_id: str) -> list[dict]:
         return []
     return _sort_reports_newest_first(reports)
 
-
 async def _select_single_report(
     ctx: Context,
     reports: list[dict],
@@ -311,19 +318,32 @@ def register_this(mcp: FastMCP) -> None:
     - choose_issue_for_remediation  -> ask user to pick one issue from a report
     - get_vulnerability             -> /api/v2/vulnerabilities/{refId}
 
+    Identifying the target project automatically:
+    Before asking the user which project to fix, read .git/config in the
+    current working directory to get the remote origin URL. Use that URL to
+    narrow down the target — depending on what the user provided:
+    - AA number only: call list_projects_for_aa, then match remote origin URL
+      against projectUri (case-insensitive, ignore .git suffix). Use the
+      matching project; only ask the user if no match is found.
+    - publicId provided: skip the AA lookup and go straight to
+      find_application_by_public_id.
+    - internal applicationId provided: skip to list_reports directly.
+
     Typical end-to-end flow (user supplies an AA number, e.g. "AA47794"):
     Quick path (single-issue remediation):
-        1. list_reports_for_aa("AA47794")           -> per-project selected report lists
-        2. get_vulnerable_components(reportDataUrl)  -> compact worklist
-        3. choose_issue_for_remediation(reportDataUrl) -> user selects exactly one issue
-        4. Remediate only that selected issue
+        1. Read .git/config -> get remote origin URL
+        2. list_reports_for_aa("AA47794") -> match origin URL to one project
+        3. get_vulnerable_components(reportDataUrl)  -> compact worklist
+        4. choose_issue_for_remediation(reportDataUrl) -> user selects one issue
+        5. Remediate only that selected issue
 
     Step-by-step path (model picks one project to drill into):
-        1. list_projects_for_aa("AA47794")               -> projectIds + URIs
-        2. find_application_by_public_id(projectId)      -> internal applicationId
-        3. list_reports(applicationId)                   -> selected report for one app
-        4. choose_issue_for_remediation(reportDataUrl)   -> user picks one issue
-        5. Remediate only the selected issue
+        1. Read .git/config -> get remote origin URL
+        2. list_projects_for_aa("AA47794") -> match origin URL to projectId
+        3. find_application_by_public_id(projectId)  -> internal applicationId
+        4. list_reports(applicationId)               -> selected report
+        5. choose_issue_for_remediation(reportDataUrl) -> user picks one issue
+        6. Remediate only the selected issue
 
     Auth:
     - Nexus IQ:       HTTP Basic from NEXUS_IQ_USERNAME / NEXUS_IQ_PASSWORD
@@ -629,16 +649,15 @@ def register_this(mcp: FastMCP) -> None:
     @mcp.tool()
     def get_vulnerable_components(report_data_url: str) -> dict:
         """
-        Convenience tool: fetch a raw report and return only the components
-        with at least one security issue, alongside the refIds of those issues.
+        Fetch a raw report and return a pre-ranked summary of vulnerable issues.
 
-        Use this to get a compact worklist before iterating get_vulnerability()
-        calls, instead of asking the model to scan the full raw report.
+        Only includes issues with severity >= 7.0 OR threatCategory in
+        ("critical", "severe"). Lower-severity issues are counted but omitted
+        from top_issues unless the user explicitly asks for them.
 
-        REMEDIATION POLICY: when synthesising a remediation plan from this
-        output, focus only on issues where severity >= 7.0 OR threatCategory
-        is "critical" or "severe". Skip lower-severity issues unless the user
-        explicitly asks otherwise.
+        Do NOT run your own Python/scripts to re-parse the report after calling
+        this tool — the ranking and filtering is already done. Show top_issues
+        to the user, ask which one to fix, then call choose_issue_for_remediation.
 
         Args:
             report_data_url: The `reportDataUrl` from a list_reports entry.
@@ -646,50 +665,68 @@ def register_this(mcp: FastMCP) -> None:
         Returns:
             {
                 "report_data_url": "...",
-                "vulnerable_component_count": 3,
-                "components": [
+                "total_vulnerable_components": 12,
+                "high_severity_issue_count": 5,
+                "top_issues": [
                     {
-                        "packageUrl": "pkg:maven/commons-collections/commons-collections@3.2.2?type=jar",
-                        "hash": "...",
-                        "componentIdentifier": {...},
-                        "issues": [
-                            {
-                                "reference": "sonatype-2024-3350",
-                                "severity": 8.7,
-                                "source": "sonatype",
-                                "status": "Open",
-                                "url": "..."
-                            }
-                        ]
-                    }
-                ]
+                        "rank": 1,
+                        "severity": 9.8,
+                        "threat_category": "critical",
+                        "reference": "CVE-2021-44228",
+                        "source": "nvd",
+                        "package": "pkg:maven/org.apache.logging.log4j/log4j-core@2.14.1",
+                        "status": "Open"
+                    },
+                    ...
+                ],
+                "next_action_for_assistant": "..."
             }
         """
         report = _fetch_raw_report(report_data_url)
 
-        vulnerable: list[dict] = []
+        _HIGH_CATEGORIES = {"critical", "severe"}
+
+        # Flatten to one row per issue, deduplicate by reference keeping max severity.
+        best: dict[str, dict] = {}
+        total_vulnerable = 0
+
         for component in report.get("components", []):
             sec = component.get("securityData") or {}
             issues = sec.get("securityIssues") or []
             if not issues:
                 continue
-            vulnerable.append(
-                {
-                    "packageUrl": component.get("packageUrl"),
-                    "hash": component.get("hash"),
-                    "componentIdentifier": component.get("componentIdentifier"),
-                    "issues": issues,
-                }
-            )
+            total_vulnerable += 1
+            pkg_url = component.get("packageUrl") or ""
+            for issue in issues:
+                ref = issue.get("reference") or ""
+                sev = issue.get("severity") or 0
+                tc = (issue.get("threatCategory") or "").lower()
+                if sev < 7.0 and tc not in _HIGH_CATEGORIES:
+                    continue
+                if ref not in best or sev > best[ref]["severity"]:
+                    best[ref] = {
+                        "reference": ref,
+                        "severity": sev,
+                        "threat_category": tc,
+                        "source": issue.get("source") or "",
+                        "status": issue.get("status") or "",
+                        "package": pkg_url,
+                    }
+
+        ranked = sorted(best.values(), key=lambda r: r["severity"], reverse=True)
+        top_issues = [{"rank": i + 1, **row} for i, row in enumerate(ranked)]
 
         return {
             "report_data_url": report_data_url,
-            "vulnerable_component_count": len(vulnerable),
-            "components": vulnerable,
+            "total_vulnerable_components": total_vulnerable,
+            "high_severity_issue_count": len(top_issues),
+            "top_issues": top_issues,
             "next_action_for_assistant": (
-                "Ask the user which single issue to fix, then call "
-                "choose_issue_for_remediation(report_data_url). Avoid iterating "
-                "over all issues unless the user explicitly asks for bulk remediation."
+                "Show top_issues to the user ranked by severity. "
+                "For each issue: call get_latest_package_version(packageUrl) if "
+                "recommendationMarkdown has no fixed version, then read the dependency "
+                "file and bump the version. Do not run npm/shell commands to find versions — "
+                "use get_latest_package_version instead."
             ),
         }
 
@@ -699,9 +736,21 @@ def register_this(mcp: FastMCP) -> None:
     async def choose_issue_for_remediation(ctx: Context, report_data_url: str) -> dict:
         """
         Fetch one report, ask the user to pick exactly one vulnerability issue,
-        then return only that issue plus vulnerability details.
+        then return that issue plus full vulnerability details.
 
         Use this before remediation to avoid bulk fixing every issue in a report.
+
+        After calling this tool, follow these steps to remediate:
+        1. Read `vulnerability.recommendationMarkdown` — it contains the safe
+           version or patch to apply.
+        2. Decode the affected package from `selected.packageUrl`:
+             pkg:maven/group/artifact@version  -> pom.xml / build.gradle
+             pkg:npm/name@version              -> package.json
+             pkg:pypi/name@version             -> requirements.txt / pyproject.toml
+             pkg:nuget/name@version            -> *.csproj / packages.config
+        3. Search the repo for the dependency declaration of that package.
+        4. Update the version to the safe version from the recommendation.
+        5. Stop — do not fix other issues unless the user explicitly asks.
 
         Args:
             ctx: MCP context used to prompt user selection.
@@ -711,7 +760,7 @@ def register_this(mcp: FastMCP) -> None:
             {
                 "report_data_url": "...",
                 "selected": {
-                    "packageUrl": "...",
+                    "packageUrl": "pkg:npm/lodash@4.17.15",
                     "componentIdentifier": {...},
                     "issue": {
                         "reference": "sonatype-2024-3350",
@@ -719,8 +768,11 @@ def register_this(mcp: FastMCP) -> None:
                         ...
                     }
                 },
-                "vulnerability": {...},
-                "next_action_for_assistant": "Remediate only this selected issue."
+                "vulnerability": {
+                    "recommendationMarkdown": "Upgrade to lodash >= 4.17.21 ...",
+                    ...
+                },
+                "next_action_for_assistant": "..."
             }
         """
         report = _fetch_raw_report(report_data_url)
@@ -766,8 +818,13 @@ def register_this(mcp: FastMCP) -> None:
             },
             "vulnerability": vulnerability,
             "next_action_for_assistant": (
-                "Remediate only this selected issue. "
-                "Do not call get_vulnerability for every other issue unless the user asks."
+                "1. Read vulnerability.recommendationMarkdown to find the safe version. "
+                "If no version is given, call get_latest_package_version(selected.packageUrl). "
+                "2. Decode the dependency file from selected.packageUrl: "
+                "npm->package.json, maven->pom.xml, golang->go.mod, pypi->requirements.txt, nuget->*.csproj. "
+                "3. Read that file and confirm the affected package is declared as a DIRECT dependency. "
+                "If it only appears as a transitive dependency, tell the user — do not edit the file. "
+                "4. If it is direct, bump the version to the safe version and save the file. "
             ),
         }
     
@@ -789,4 +846,84 @@ def register_this(mcp: FastMCP) -> None:
                 inside securityData.securityIssues[] in the scan report.
         """
         return _iq_get(f"/api/v2/vulnerabilities/{ref_id}")
+
+    @mcp.tool()
+    def get_latest_package_version(package_url: str) -> dict:
+        """
+        Query the internal Nexus Repository Manager for available versions of a
+        package. Use this when recommendationMarkdown does not specify a fixed
+        version — find the latest available version internally and use that.
+
+        Requires NEXUS_REPO_BASE_URL to be set.
+
+        Args:
+            package_url: The purl from selected.packageUrl, e.g.:
+                "pkg:npm/lodash@4.17.15"
+                "pkg:maven/org.apache.commons/commons-lang3@3.12.0"
+                "pkg:pypi/requests@2.28.0"
+
+        Returns:
+            {
+                "package": "lodash",
+                "format": "npm",
+                "versions": ["4.17.21", "4.17.20", ...],
+                "latest": "4.17.21"
+            }
+        """
+        if not _nexus_repo_client:
+            raise RuntimeError(
+                "NEXUS_REPO_BASE_URL is not set — cannot query Nexus Repository."
+            )
+
+        # Parse purl: pkg:format/[group/]name@version
+        # Strip leading "pkg:" then split on "/" and "@"
+        raw = package_url
+        if raw.startswith("pkg:"):
+            raw = raw[4:]
+        purl_type, _, rest = raw.partition("/")
+        purl_type = purl_type.lower()
+
+        # Map purl type -> Nexus Repository format param
+        _PURL_TO_NEXUS_FORMAT = {
+            "npm": "npm",
+            "maven": "maven2",
+            "golang": "go",
+            "go": "go",
+            "pypi": "pypi",
+            "nuget": "nuget",
+            "rubygems": "rubygems",
+            "composer": "composer",
+        }
+        fmt = _PURL_TO_NEXUS_FORMAT.get(purl_type, purl_type)
+
+        # rest may be "group/name@version" or "name@version" (golang has long paths)
+        name_part = rest.rsplit("/", 1)[-1]  # take last path segment
+        name, _, _ = name_part.partition("@")
+
+        resp = _nexus_repo_client.get(
+            "/service/rest/v1/search",
+            params={"format": fmt, "name": name, "sort": "version", "direction": "desc"},
+        )
+        if resp.status_code == 404 or resp.status_code == 400:
+            raise RuntimeError(
+                f"Nexus Repository returned {resp.status_code} for {fmt}/{name}."
+            )
+        resp.raise_for_status()
+
+        items = resp.json().get("items") or []
+        versions = list(dict.fromkeys(
+            item["version"] for item in items if item.get("version")
+        ))
+
+        if not versions:
+            raise RuntimeError(
+                f"No versions found in Nexus Repository for {fmt}/{name}."
+            )
+
+        return {
+            "package": name,
+            "format": fmt,
+            "latest": versions[0],
+            "versions": versions[:20],
+        }
 
