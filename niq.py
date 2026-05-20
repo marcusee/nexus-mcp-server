@@ -800,6 +800,23 @@ def register_this(mcp: FastMCP) -> None:
         if not isinstance(selection, AcceptedElicitation):
             raise ValueError("Issue selection cancelled.")
 
+        # For transitive deps: prefer upgrading the direct parent over adding an override/exclude.
+        # Each ecosystem has a shell command to trace which direct dep pulls in the transitive one;
+        # upgrade that parent to its latest version so it brings in a safe transitive version.
+        _TRANSITIVE_GUIDANCE = (
+            "If the package is TRANSITIVE (not declared directly): "
+            "DO NOT add an npm override, Maven exclusion, or similar workaround as a first resort. "
+            "Instead, find the direct parent that pulls it in using the ecosystem-appropriate command: "
+            "npm -> `npm ls <pkg>` or parse package-lock.json; "
+            "maven -> `mvn dependency:tree -Dincludes=group:artifact`; "
+            "go -> `go mod graph | grep <module>`; "
+            "pypi -> `pip show <pkg>` (check Required-by) or parse poetry.lock/Pipfile.lock; "
+            "nuget -> `dotnet list package --include-transitive`. "
+            "Then call get_latest_package_version on the parent and upgrade it — "
+            "the updated parent will pull in a safe version of the transitive dep. "
+            "Only fall back to an override/exclude if no parent upgrade resolves it."
+        )
+
         fix_all_instructions = (
             "1. For each item in `issues`: "
             "read vulnerability.recommendationMarkdown to find the safe version. "
@@ -807,7 +824,7 @@ def register_this(mcp: FastMCP) -> None:
             "2. Decode the dependency file from item.packageUrl: "
             "npm->package.json, maven->pom.xml, golang->go.mod, pypi->requirements.txt, nuget->*.csproj. "
             "3. Read that file and confirm the package is a DIRECT dependency. "
-            "If transitive only, skip it and tell the user. "
+            f"{_TRANSITIVE_GUIDANCE} "
             "4. If direct, bump the version to the safe version and save the file. "
             "5. Repeat for every item in the list."
         )
@@ -858,7 +875,7 @@ def register_this(mcp: FastMCP) -> None:
                 "2. Decode the dependency file from selected.packageUrl: "
                 "npm->package.json, maven->pom.xml, golang->go.mod, pypi->requirements.txt, nuget->*.csproj. "
                 "3. Read that file and confirm the affected package is declared as a DIRECT dependency. "
-                "If it only appears as a transitive dependency, tell the user — do not edit the file. "
+                f"{_TRANSITIVE_GUIDANCE} "
                 "4. If it is direct, bump the version to the safe version and save the file. "
             ),
         }
