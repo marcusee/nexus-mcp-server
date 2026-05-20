@@ -192,17 +192,36 @@ def _flatten_report_issues(report: dict) -> list[dict]:
     return rows
 
 
+def _severity_label(score: float | None) -> str:
+    if score is None:
+        return "UNKNOWN"
+    if score >= 9.0:
+        return "CRITICAL"
+    if score >= 7.0:
+        return "HIGH"
+    if score >= 4.0:
+        return "MEDIUM"
+    return "LOW"
+
+
+def _short_package_name(package_url: str | None) -> str:
+    """Extract 'name@version' from a purl, e.g. pkg:npm/lodash@4.17.15 -> lodash@4.17.15."""
+    if not package_url:
+        return "unknown"
+    # strip pkg:type/ prefix, take last path segment (handles group/name)
+    raw = package_url.split(":", 1)[-1]          # npm/lodash@4.17.15
+    raw = raw.split("/", 1)[-1] if "/" in raw else raw  # lodash@4.17.15 or group/name@ver
+    return raw.rsplit("/", 1)[-1]                # take last segment for maven group paths
+
+
 def _issue_choice_title(row: dict) -> str:
-    """Readable choice text for issue selection prompts."""
     issue = row["issue"]
-    reference = issue.get("reference") or "unknown-ref"
     severity = issue.get("severity")
-    source = issue.get("source") or "unknown-source"
-    package_url = row.get("packageUrl") or "unknown-package"
-    return (
-        f"ref={reference} | severity={severity} | source={source} | "
-        f"package={package_url}"
-    )
+    label = _severity_label(severity)
+    score = f"{severity:.1f}" if severity is not None else "?"
+    reference = issue.get("reference") or "unknown-ref"
+    pkg = _short_package_name(row.get("packageUrl"))
+    return f"[{label} {score}]  {reference}  —  {pkg}"
 
 
 def _get_sorted_reports(application_id: str) -> list[dict]:
