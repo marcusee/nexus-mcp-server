@@ -814,7 +814,9 @@ def register_this(mcp: FastMCP) -> None:
             "nuget -> `dotnet list package --include-transitive`. "
             "Then call get_latest_package_version on the parent and upgrade it — "
             "the updated parent will pull in a safe version of the transitive dep. "
-            "Only fall back to an override/exclude if no parent upgrade resolves it."
+            "Only fall back to an override/exclude if no parent upgrade resolves it. "
+            "After editing any dependency file, STOP — do NOT run npm install, mvn install, "
+            "go mod tidy, pip install, dotnet restore, or any other package manager command."
         )
 
         fix_all_instructions = (
@@ -877,6 +879,8 @@ def register_this(mcp: FastMCP) -> None:
                 "3. Read that file and confirm the affected package is declared as a DIRECT dependency. "
                 f"{_TRANSITIVE_GUIDANCE} "
                 "4. If it is direct, bump the version to the safe version and save the file. "
+                "STOP after saving — do NOT run npm install, mvn install, go mod tidy, "
+                "pip install, dotnet restore, or any other package manager command. "
             ),
         }
     
