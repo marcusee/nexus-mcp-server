@@ -178,6 +178,8 @@ def _flatten_report_issues(report: dict) -> list[dict]:
     for component in report.get("components", []):
         sec = component.get("securityData") or {}
         for issue in sec.get("securityIssues") or []:
+            if _severity_score(issue) < 7.0:
+                continue
             rows.append(
                 {
                     "packageUrl": component.get("packageUrl"),
@@ -819,16 +821,24 @@ def register_this(mcp: FastMCP) -> None:
             "go mod tidy, pip install, dotnet restore, or any other package manager command."
         )
 
+        _VERSION_RESOLUTION = (
+            "To determine the safe version to upgrade to, follow this priority order — "
+            "stop at the first step that gives a concrete version number: "
+            "STEP A: Read vulnerability.recommendationMarkdown. "
+            "If it contains a specific version (e.g. 'upgrade to >= 4.17.21' or 'use 3.2.0+'), use that version. "
+            "STEP B (fallback only): If recommendationMarkdown is empty or contains no version number, "
+            "call get_latest_package_version(packageUrl) and use the returned latest version. "
+            "Do NOT call get_latest_package_version if STEP A already gave a version."
+        )
+
         fix_all_instructions = (
-            "1. For each item in `issues`: "
-            "read vulnerability.recommendationMarkdown to find the safe version. "
-            "If no version is given, call get_latest_package_version(item.packageUrl). "
-            "2. Decode the dependency file from item.packageUrl: "
+            f"For each item in `issues`: {_VERSION_RESOLUTION} "
+            "Then: decode the dependency file from item.packageUrl: "
             "npm->package.json, maven->pom.xml, golang->go.mod, pypi->requirements.txt, nuget->*.csproj. "
-            "3. Read that file and confirm the package is a DIRECT dependency. "
+            "Read that file and confirm the package is a DIRECT dependency. "
             f"{_TRANSITIVE_GUIDANCE} "
-            "4. If direct, bump the version to the safe version and save the file. "
-            "5. Repeat for every item in the list."
+            "If direct, bump the version to the safe version and save the file. "
+            "Repeat for every item in the list."
         )
 
         if selection.data == "all":
@@ -872,15 +882,16 @@ def register_this(mcp: FastMCP) -> None:
             },
             "vulnerability": vulnerability,
             "next_action_for_assistant": (
-                "1. Read vulnerability.recommendationMarkdown to find the safe version. "
-                "If no version is given, call get_latest_package_version(selected.packageUrl). "
+                f"1. {_VERSION_RESOLUTION} "
                 "2. Decode the dependency file from selected.packageUrl: "
                 "npm->package.json, maven->pom.xml, golang->go.mod, pypi->requirements.txt, nuget->*.csproj. "
                 "3. Read that file and confirm the affected package is declared as a DIRECT dependency. "
                 f"{_TRANSITIVE_GUIDANCE} "
                 "4. If it is direct, bump the version to the safe version and save the file. "
-                "STOP after saving — do NOT run npm install, mvn install, go mod tidy, "
-                "pip install, dotnet restore, or any other package manager command. "
+                "STOP after saving — do NOT run any shell or package manager command whatsoever "
+                "(including npm install, npm install --package-lock-only, mvn install, "
+                "go mod tidy, pip install, dotnet restore, or any variant). "
+                "Leave lockfile regeneration to the user. "
             ),
         }
     
