@@ -783,19 +783,53 @@ def register_this(mcp: FastMCP) -> None:
             )
 
         choices = {
-            str(idx): {"title": _issue_choice_title(row)}
-            for idx, row in enumerate(rows, start=1)
+            "all": {"title": f"Fix ALL {len(rows)} issues"},
+            **{
+                str(idx): {"title": _issue_choice_title(row)}
+                for idx, row in enumerate(rows, start=1)
+            },
         }
         selection = await ctx.elicit(
             (
                 f"Report has {len(rows)} vulnerable issue(s). "
-                "Choose exactly one issue to remediate now."
+                "Choose one issue to remediate, or choose 'Fix ALL' to remediate every issue."
             ),
             choices,
         )
 
         if not isinstance(selection, AcceptedElicitation):
             raise ValueError("Issue selection cancelled.")
+
+        fix_all_instructions = (
+            "1. For each item in `issues`: "
+            "read vulnerability.recommendationMarkdown to find the safe version. "
+            "If no version is given, call get_latest_package_version(item.packageUrl). "
+            "2. Decode the dependency file from item.packageUrl: "
+            "npm->package.json, maven->pom.xml, golang->go.mod, pypi->requirements.txt, nuget->*.csproj. "
+            "3. Read that file and confirm the package is a DIRECT dependency. "
+            "If transitive only, skip it and tell the user. "
+            "4. If direct, bump the version to the safe version and save the file. "
+            "5. Repeat for every item in the list."
+        )
+
+        if selection.data == "all":
+            issues_with_vulns = []
+            for row in rows:
+                ref_id = row["issue"].get("reference")
+                vulnerability = _iq_get(f"/api/v2/vulnerabilities/{ref_id}") if ref_id else {}
+                issues_with_vulns.append({
+                    "packageUrl": row.get("packageUrl"),
+                    "hash": row.get("hash"),
+                    "componentIdentifier": row.get("componentIdentifier"),
+                    "issue": row["issue"],
+                    "vulnerability": vulnerability,
+                })
+            return {
+                "report_data_url": report_data_url,
+                "mode": "fix_all",
+                "issues": issues_with_vulns,
+                "next_action_for_assistant": fix_all_instructions,
+            }
 
         selected_index = int(selection.data) - 1
         if selected_index < 0 or selected_index >= len(rows):
@@ -810,6 +844,7 @@ def register_this(mcp: FastMCP) -> None:
         vulnerability = _iq_get(f"/api/v2/vulnerabilities/{ref_id}")
         return {
             "report_data_url": report_data_url,
+            "mode": "fix_one",
             "selected": {
                 "packageUrl": selected.get("packageUrl"),
                 "hash": selected.get("hash"),
@@ -926,4 +961,3 @@ def register_this(mcp: FastMCP) -> None:
             "latest": versions[0],
             "versions": versions[:20],
         }
-
