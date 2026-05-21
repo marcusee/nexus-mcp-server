@@ -405,8 +405,7 @@ def register_this(mcp: FastMCP) -> None:
     - find_application_by_public_id -> GitLab projectId -> IQ internal id
     - list_reports_for_aa           (chained) AA -> one selected report per project
     - list_reports                  -> /api/v2/reports/applications/{applicationId}
-    - choose_issue_for_remediation  -> ask user to pick one issue from a report
-    - get_vulnerability             -> /api/v2/vulnerabilities/{refId}
+    - get_remediation_plan          -> pick one issue (or ALL) and get remediation info
 
     Identifying the target project automatically:
     Before asking the user which project to fix, read .git/config in the
@@ -423,16 +422,16 @@ def register_this(mcp: FastMCP) -> None:
     Quick path (single-issue remediation):
         1. Read .git/config -> get remote origin URL
         2. list_reports_for_aa("AA47794") -> match origin URL to one project
-        3. choose_issue_for_remediation(reportDataUrl) -> user selects one issue
-        4. Remediate only that selected issue
+        3. get_remediation_plan(reportDataUrl) -> user selects one issue (or ALL)
+        4. Remediate only the selected issue(s)
 
     Step-by-step path (model picks one project to drill into):
         1. Read .git/config -> get remote origin URL
         2. list_projects_for_aa("AA47794") -> match origin URL to projectId
         3. find_application_by_public_id(projectId)  -> internal applicationId
         4. list_reports(applicationId)               -> selected report
-        5. choose_issue_for_remediation(reportDataUrl) -> user picks one issue
-        6. Remediate only the selected issue
+        5. get_remediation_plan(reportDataUrl) -> user picks one issue (or ALL)
+        6. Remediate only the selected issue(s)
 
     Auth:
     - Nexus IQ:       HTTP Basic from NEXUS_IQ_USERNAME / NEXUS_IQ_PASSWORD
@@ -679,12 +678,17 @@ def register_this(mcp: FastMCP) -> None:
 
 
     @mcp.tool()
-    async def choose_issue_for_remediation(ctx: Context, report_data_url: str) -> dict:
+    async def get_remediation_plan(ctx: Context, report_data_url: str) -> dict:
         """
-        Fetch one report, ask the user to pick exactly one vulnerability issue,
-        then return that issue plus full vulnerability details.
+        Use this to get remediation info for a report's vulnerabilities.
 
-        Use this before remediation to avoid bulk fixing every issue in a report.
+        Fetches one report, asks the user to pick exactly one vulnerability issue
+        (or choose "Fix ALL"), then returns the selected issue(s) enriched with
+        full vulnerability details, the latest available package version, and
+        step-by-step remediation instructions for the assistant.
+
+        Use this before remediation so the user controls whether one issue or
+        every issue in the report gets fixed.
 
         After calling this tool, follow these steps to remediate:
         1. Read `vulnerability.recommendationMarkdown` — it contains the safe
