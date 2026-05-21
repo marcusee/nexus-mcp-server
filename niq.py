@@ -408,6 +408,58 @@ def _fetch_raw_report(report_data_url: str) -> dict:
     raise RuntimeError(f"Nexus IQ returned 404 for {url1}")
 
 
+_AA_RE = re.compile(r"(?i)^AA\d+$")
+
+
+def _list_projects_for_aa(aa_number: str) -> dict:
+    """Look up GitLab projects mapped to an AA number via the RBAC API."""
+    payload = _aa_mapping_post(
+        "/api/v1/rbac:findRbacMapping", json_body={"swc": aa_number}
+    )
+    projects_raw = payload.get("projects") or []
+    if not projects_raw:
+        raise RuntimeError(
+            f"AA number {aa_number!r} has no GitLab projects in RBAC mapping."
+        )
+    # Normalise projectId to a string — IQ publicIds are strings, but the
+    # RBAC API returns them as integers.
+    projects = [
+        {"projectId": str(p.get("projectId")), "projectUri": p.get("projectUri")}
+        for p in projects_raw
+    ]
+    return {
+        "aa_number": aa_number,
+        "appdir_id": payload.get("appdirId"),
+        "name": payload.get("name"),
+        "project_count": len(projects),
+        "projects": projects,
+    }
+
+
+def _find_application_by_public_id(public_id: str) -> dict:
+    """Resolve a Nexus IQ application by its publicId (a GitLab project id).
+
+    Server-side filtered (GET /api/v2/applications?publicId=...), not a catalog
+    scan, so it stays fast even on instances with tens of thousands of apps.
+    """
+    resp = _iq_get("/api/v2/applications", params={"publicId": public_id})
+    apps = resp.get("applications") or []
+    if not apps:
+        raise RuntimeError(
+            f"No Nexus IQ application has publicId={public_id!r}. "
+            f"The project may not be onboarded for scanning."
+        )
+    return apps[0]
+
+
+def _application_choice_title(app: dict) -> str:
+    """Concise label for interactive application selection."""
+    name = app.get("name") or "unknown-app"
+    public_id = app.get("publicId") or "?"
+    uri = app.get("projectUri") or ""
+    return f"{name}  (publicId={public_id})  {uri}".rstrip()
+
+
 # ---------------------------------------------------------------------------
 # MCP tool registration
 # ---------------------------------------------------------------------------
@@ -421,37 +473,26 @@ def register_this(mcp: FastMCP) -> None:
     reason about vulnerabilities for remediation.
 
     Tools:
-    - list_projects_for_aa          -> AA number -> list of GitLab projectIds
-    - find_application_by_public_id -> GitLab projectId -> IQ internal id
-    - list_reports_for_aa           (chained) AA -> one selected report per project
-    - list_reports                  -> /api/v2/reports/applications/{applicationId}
-    - get_remediation_plan          -> pick one issue (or ALL) and get remediation info
+    - resolve_application_id   -> AA number OR publicId -> IQ applicationId(s)
+    - list_reports            -> /api/v2/reports/applications/{applicationId}
+    - get_remediation_plan    -> pick one issue (or ALL) and get remediation info
+    - get_latest_package_version -> latest version of a package in Nexus Repository
 
-    Identifying the target project automatically:
-    Before asking the user which project to fix, read .git/config in the
-    current working directory to get the remote origin URL. Use that URL to
-    narrow down the target — depending on what the user provided:
-    - AA number only: call list_projects_for_aa, then match remote origin URL
-      against projectUri (case-insensitive, ignore .git suffix). Use the
-      matching project; only ask the user if no match is found.
-    - publicId provided: skip the AA lookup and go straight to
-      find_application_by_public_id.
+    Identifying the target application:
+    - AA number: call resolve_application_id. If the AA maps to several
+      applications the user is prompted to choose one; a single match is
+      returned directly.
+    - publicId provided: call resolve_application_id with the publicId — it
+      resolves directly to a single application.
     - internal applicationId provided: skip to list_reports directly.
 
     Typical end-to-end flow (user supplies an AA number, e.g. "AA47794"):
-    Quick path (single-issue remediation):
-        1. Read .git/config -> get remote origin URL
-        2. list_reports_for_aa("AA47794") -> match origin URL to one project
-        3. get_remediation_plan(reportDataUrl) -> user selects one issue (or ALL)
-        4. Remediate only the selected issue(s)
-
-    Step-by-step path (model picks one project to drill into):
-        1. Read .git/config -> get remote origin URL
-        2. list_projects_for_aa("AA47794") -> match origin URL to projectId
-        3. find_application_by_public_id(projectId)  -> internal applicationId
-        4. list_reports(applicationId)               -> selected report
-        5. get_remediation_plan(reportDataUrl) -> user picks one issue (or ALL)
-        6. Remediate only the selected issue(s)
+        1. resolve_application_id("AA47794") -> user picks one application (if
+           multiple) -> applications[0].applicationId
+        2. list_reports(applicationId) -> selected report (reportDataUrl)
+        3. get_remediation_plan(reportDataUrl) -> user picks one issue (or ALL)
+        4. Remediate only the selected issue(s); use get_latest_package_version
+           when a recommendation does not state a fixed version
 
     Auth:
     - Nexus IQ:       HTTP Basic from NEXUS_IQ_USERNAME / NEXUS_IQ_PASSWORD
@@ -467,157 +508,78 @@ def register_this(mcp: FastMCP) -> None:
     """
 
     @mcp.tool()
-    def list_projects_for_aa(aa_number: str) -> dict:
+    async def resolve_application_id(ctx: Context, identifier: str) -> dict:
         """
-        Look up GitLab projects associated with an AA number via the RBAC API.
+        Step 0 of remediation: resolve a Nexus IQ internal applicationId from
+        either an AA number or a GitLab project publicId.
 
-        Calls: POST {RBAC_BASE_URL}/api/v1/rbac:findRbacMapping
-            body: {"swc": "<AA number>"}
+        - AA number (e.g. "AA47794"): looks up every GitLab project mapped to
+          that AA and resolves each to its IQ application. If more than one
+          application is found, the user is prompted to choose one, and only the
+          chosen application is returned. Projects never onboarded to IQ are
+          listed in `unmapped_projects`, not failed.
+        - publicId (a GitLab project id, e.g. "271098"): resolves directly to
+          the single application.
 
         Args:
-            aa_number: The AA number / SWC, e.g. "AA47794".
+            ctx: MCP context used to prompt the user when an AA maps to several
+                applications.
+            identifier: An AA number ("AA47794") or a GitLab project publicId
+                ("271098").
 
         Returns:
             {
-            "aa_number": "AA47794",
-            "appdir_id": "ABA834C73B684D03945FCFAC5081A484",
-            "name": "rbac/AA47794/mapping/...",
-            "project_count": 12,
-            "projects": [
-                {"projectId": "271098",
-                "projectUri": "https://devcloud.example.net/.../da-deploy"},
-                ...
-            ]
+                "identifier": "AA47794",
+                "kind": "aa",                       # "aa" | "public_id"
+                "applications": [                   # one entry once selected
+                    {
+                        "applicationId": "f81a5c...",  # internal id -> list_reports
+                        "publicId": "271098",
+                        "name": "...",
+                        "projectUri": "https://devcloud.example.net/.../da-deploy"
+                    }
+                ],
+                "unmapped_projects": [              # AA only; [] for publicId
+                    {"projectId": "265215", "projectUri": "...", "reason": "..."}
+                ],
+                "errors": [                         # AA only; [] for publicId
+                    {"projectId": "...", "error": "..."}
+                ]
             }
 
-            The `projectId` values are what Nexus IQ stores as `publicId`
-            for each application — pass them to find_application_by_public_id.
-
-        Raises:
-            RuntimeError if the AA number maps to zero projects.
+        Next step: take applications[0].applicationId, then call
+        list_reports(applicationId).
         """
-        payload = _aa_mapping_post(
-            "/api/v1/rbac:findRbacMapping", json_body={"swc": aa_number}
-        )
+        identifier = identifier.strip()
 
-        projects_raw = payload.get("projects") or []
-        if not projects_raw:
-            raise RuntimeError(
-                f"AA number {aa_number!r} has no GitLab projects in RBAC mapping."
-            )
-
-        # Normalise projectId to a string — IQ publicIds are strings, but the
-        # RBAC API returns them as integers.
-        projects = [
-            {
-                "projectId": str(p.get("projectId")),
-                "projectUri": p.get("projectUri"),
-            }
-            for p in projects_raw
-        ]
-
-        return {
-            "aa_number": aa_number,
-            "appdir_id": payload.get("appdirId"),
-            "name": payload.get("name"),
-            "project_count": len(projects),
-            "projects": projects,
-        }
-
-    @mcp.tool()
-    def find_application_by_public_id(public_id: str) -> dict:
-        """
-        Look up a Nexus IQ application by its publicId (a GitLab project ID
-        in this deployment) and return its internal applicationId.
-
-        Calls: GET /api/v2/applications?publicId={publicId}
-
-        This is server-side filtered, NOT a catalog scan, so it stays fast
-        even on instances with tens of thousands of applications.
-
-        Args:
-            public_id: The application's publicId in Nexus IQ. In this
-                deployment that is the GitLab project ID, e.g. "271098".
-
-        Returns:
-            {
-                "id": "f81a5c32544e4d55be8a0d0651dd7145",  # internal id
-                "publicId": "271098",
-                "name": "...",
-                "organizationId": "...",
-                "contactUserName": null | "...",
-                "applicationTags": [...]
+        # publicId path: a GitLab project id resolves to exactly one application.
+        if not _AA_RE.match(identifier):
+            app = _find_application_by_public_id(identifier)
+            return {
+                "identifier": identifier,
+                "kind": "public_id",
+                "applications": [
+                    {
+                        "applicationId": app["id"],
+                        "publicId": app.get("publicId"),
+                        "name": app.get("name"),
+                        "projectUri": None,
+                    }
+                ],
+                "unmapped_projects": [],
+                "errors": [],
             }
 
-        Raises:
-            RuntimeError if no application matches the publicId (e.g. the
-            GitLab project has never been onboarded to Nexus IQ).
-        """
-        resp = _iq_get("/api/v2/applications", params={"publicId": public_id})
-        apps = resp.get("applications") or []
-        if not apps:
-            raise RuntimeError(
-                f"No Nexus IQ application has publicId={public_id!r}. "
-                f"The project may not be onboarded for scanning."
-            )
-        return apps[0]
-
-    @mcp.tool()
-    async def list_reports_for_aa(ctx: Context, aa_number: str) -> dict:
-        """
-        Convenience tool: take an AA number, fan out to every associated
-        GitLab project, and return Nexus IQ reports for each.
-
-        If a project has multip[lre reports, the user is prompted to choose one
-        report before this tool includes it in the output.
-
-        Internally chains:
-        1. list_projects_for_aa(aa_number)
-        2. for each project: find_application_by_public_id + list_reports
-
-        Projects that have no IQ application (never onboarded) are reported
-        in `unmapped_projects` rather than failing the whole call. Other
-        per-project errors land in `errors`.
-
-        Args:
-            aa_number: The AA number, e.g. "AA47794".
-
-        Returns:
-            {
-            "aa_number": "AA47794",
-            "project_count": 12,
-            "mapped_count": 9,
-            "results": [
-                {
-                "projectId": "271098",
-                "projectUri": "...",
-                "applicationId": "f81a5c...",
-                "applicationPublicId": "271098",
-                "applicationName": "...",
-                "reports": [ {stage, evaluationDate, reportDataUrl, ...}, ... ]
-                },
-                ...
-            ],
-            "unmapped_projects": [
-                {"projectId": "265215", "projectUri": "...",
-                "reason": "No Nexus IQ application has publicId='265215'."}
-            ],
-            "errors": [
-                {"projectId": "...", "error": "..."}
-            ]
-            }
-        """
-        mapping = list_projects_for_aa(aa_number)
-        projects = mapping["projects"]
-
-        results: list[dict] = []
+        # AA path: fan out to every mapped project and resolve each.
+        mapping = _list_projects_for_aa(identifier)
+        applications: list[dict] = []
         unmapped: list[dict] = []
         errors: list[dict] = []
 
-        for project in projects:
+        for project in mapping["projects"]:
             project_id = project["projectId"]
             try:
-                app = find_application_by_public_id(project_id)
+                app = _find_application_by_public_id(project_id)
             except RuntimeError as exc:
                 # Most common case: project not onboarded to IQ.
                 unmapped.append(
@@ -632,69 +594,80 @@ def register_this(mcp: FastMCP) -> None:
                 errors.append({"projectId": project_id, "error": str(exc)})
                 continue
 
-            try:
-                reports = _get_sorted_reports(app["id"])
-            except (RuntimeError, httpx.HTTPError) as exc:
-                errors.append({"projectId": project_id, "error": str(exc)})
-                continue
-            reports = await _select_single_report(
-                ctx,
-                reports,
-                prompt_subject=f"Project {project_id}",
-            )
-
-            results.append(
+            applications.append(
                 {
-                    "projectId": project_id,
-                    "projectUri": project["projectUri"],
                     "applicationId": app["id"],
-                    "applicationPublicId": app.get("publicId"),
-                    "applicationName": app.get("name"),
-                    "reports": reports,
+                    "publicId": app.get("publicId"),
+                    "name": app.get("name"),
+                    "projectUri": project["projectUri"],
                 }
             )
 
+        # When an AA maps to several applications, let the user pick one.
+        if len(applications) > 1:
+            choices = {
+                str(idx): {"title": _application_choice_title(app)}
+                for idx, app in enumerate(applications, start=1)
+            }
+            selection = await ctx.elicit(
+                (
+                    f"AA {identifier} maps to {len(applications)} applications. "
+                    "Which one do you want to remediate?"
+                ),
+                choices,
+            )
+            if not isinstance(selection, AcceptedElicitation):
+                raise ValueError("Application selection cancelled.")
+            selected_index = int(selection.data) - 1
+            if selected_index < 0 or selected_index >= len(applications):
+                raise ValueError("Invalid application selection.")
+            applications = [applications[selected_index]]
+
         return {
-            "aa_number": aa_number,
-            "project_count": mapping["project_count"],
-            "mapped_count": len(results),
-            "results": results,
+            "identifier": identifier,
+            "kind": "aa",
+            "applications": applications,
             "unmapped_projects": unmapped,
             "errors": errors,
         }
 
-
     @mcp.tool()
-    def get_latest_report(application_id: str, stage: str | None = "release") -> dict:
-        """Return the newest report for an app, optionally filtered by stage.
+    async def list_reports(ctx: Context, application_id: str) -> list:
+        """
+        List all evaluation reports/scans for one Nexus IQ application.
+
+        Calls: GET /api/v2/reports/applications/{applicationId}
 
         Args:
-            application_id: Internal Nexus IQ application id.
-            stage: Optional stage name (e.g. "build", "release").
-                Defaults to "release".
+            application_id: The application's INTERNAL id (the `applicationId`
+                field from resolve_application_id, e.g.
+                "f81a5c32544e4d55be8a0d0651dd7145"). NOT the publicId.
 
         Returns:
-            The newest report summary dict (same shape as list_reports entries).
-
-        Raises:
-            RuntimeError if no reports exist (or none match stage).
+            A list of report summaries. If multiple reports exist, the user is
+            prompted to manually choose one report to proceed and only the
+            selected report is returned. Each entry includes a `reportDataUrl`
+            (the path to the raw report) — pass that back into get_report or
+            get_vulnerable_components without parsing out a scan id. Typical
+            entry:
+            {
+                "stage": "build",           # build | stage-release | release | operate | ...
+                "applicationId": "f81a5c...",
+                "evaluationDate": "2026-05-01T10:42:15.212+01:00",
+                "latestReportHtmlUrl": "ui/links/application/.../latestReport/build",
+                "reportHtmlUrl": "ui/links/application/.../report/...",
+                "embeddableReportHtmlUrl": "ui/links/application/.../report/.../embeddable",
+                "reportPdfUrl": "ui/links/application/.../report/.../pdf",
+                "reportDataUrl": "api/v2/applications/.../reports/.../raw"
+            }
         """
         reports = _get_sorted_reports(application_id)
-        if not reports:
-            raise RuntimeError(
-                f"No Nexus IQ reports found for application_id={application_id!r}."
-            )
+        return await _select_single_report(
+            ctx,
+            reports,
+            prompt_subject=f"Application {application_id}",
+        )
 
-        if stage:
-            reports = [r for r in reports if r.get("stage") == stage]
-            if not reports:
-                raise RuntimeError(
-                    f"No Nexus IQ reports found for application_id={application_id!r} "
-                    f"with stage={stage!r}."
-                )
-
-        # list_reports() is already sorted newest-first.
-        return reports[0]
 
 
     @mcp.tool()
@@ -724,7 +697,7 @@ def register_this(mcp: FastMCP) -> None:
 
         Args:
             ctx: MCP context used to prompt user selection.
-            report_data_url: The `reportDataUrl` from list_reports/list_reports_for_aa.
+            report_data_url: The `reportDataUrl` from list_reports.
 
         Returns:
             The shape depends on the user's selection (`mode`).
