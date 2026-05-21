@@ -318,8 +318,28 @@ def _try_get_latest_package_version(package_url: str) -> dict | None:
         return None
 
 
+# Fields kept from the /api/v2/vulnerabilities/{refId} payload. The rest is
+# structured metadata the remediation flow never reads, and it multiplies in
+# fix_all mode (one full payload per issue), so we whitelist down to signal.
+_VULN_KEEP_FIELDS = (
+    "recommendationMarkdown",
+    "description",
+    "explanationMarkdown",
+    "mainSeverity",
+    "identifier",
+    "vulnIds",
+    "vulnerabilityLink",
+    "advisories",
+)
+
+
+def _slim_vulnerability(vuln: dict) -> dict:
+    """Whitelist the vulnerability payload down to the fields remediation actually uses."""
+    return {key: vuln[key] for key in _VULN_KEEP_FIELDS if key in vuln}
+
+
 def _enrich_issue_row(row: dict) -> dict:
-    """Attach full vulnerability details and the latest available package version to a flattened issue row."""
+    """Attach trimmed vulnerability details and the latest available package version to a flattened issue row."""
     ref_id = row["issue"].get("reference")
     vulnerability = _iq_get(f"/api/v2/vulnerabilities/{ref_id}") if ref_id else {}
     return {
@@ -327,7 +347,7 @@ def _enrich_issue_row(row: dict) -> dict:
         "hash": row.get("hash"),
         "componentIdentifier": row.get("componentIdentifier"),
         "issue": row["issue"],
-        "vulnerability": vulnerability,
+        "vulnerability": _slim_vulnerability(vulnerability),
         "latest_package_version": _try_get_latest_package_version(row.get("packageUrl") or ""),
     }
 
