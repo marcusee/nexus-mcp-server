@@ -177,6 +177,7 @@ def _flatten_report_issues(report: dict) -> list[dict]:
     rows: list[dict] = []
     for component in report.get("components", []):
         sec = component.get("securityData") or {}
+        dep = component.get("dependencyData") or {}
         for issue in sec.get("securityIssues") or []:
             if _severity_score(issue) < 7.0:
                 continue
@@ -185,6 +186,8 @@ def _flatten_report_issues(report: dict) -> list[dict]:
                     "packageUrl": component.get("packageUrl"),
                     "hash": component.get("hash"),
                     "componentIdentifier": component.get("componentIdentifier"),
+                    "directDependency": dep.get("directDependency"),
+                    "parentComponentPurls": dep.get("parentComponentPurls") or [],
                     "issue": issue,
                 }
             )
@@ -346,6 +349,8 @@ def _enrich_issue_row(row: dict) -> dict:
         "packageUrl": row.get("packageUrl"),
         "hash": row.get("hash"),
         "componentIdentifier": row.get("componentIdentifier"),
+        "directDependency": row.get("directDependency"),
+        "parentComponentPurls": row.get("parentComponentPurls") or [],
         "issue": row["issue"],
         "vulnerability": _slim_vulnerability(vulnerability),
         "latest_package_version": _try_get_latest_package_version(row.get("packageUrl") or ""),
@@ -684,16 +689,18 @@ def register_this(mcp: FastMCP) -> None:
         every issue in the report gets fixed.
 
         After calling this tool, follow these steps to remediate:
-        1. Read `vulnerability.recommendationMarkdown` — it contains the safe
-           version or patch to apply.
-        2. Decode the affected package from `selected.packageUrl`:
-             pkg:maven/group/artifact@version  -> pom.xml / build.gradle
-             pkg:npm/name@version              -> package.json
-             pkg:pypi/name@version             -> requirements.txt / pyproject.toml
-             pkg:nuget/name@version            -> *.csproj / packages.config
-        3. Search the repo for the dependency declaration of that package.
-        4. Update the version to the safe version from the recommendation.
-        5. Stop — do not fix other issues unless the user explicitly asks.
+        1. Determine the safe version (recommendationMarkdown, else
+           latest_package_version.latest — see next_action_for_assistant).
+        2. Apply the fix based on `directDependency` (already in the data):
+             - direct: bump the package's version in its manifest
+               (npm->package.json, maven->pom.xml, golang->go.mod,
+                pypi->requirements.txt/pyproject.toml, nuget->*.csproj).
+             - transitive (directDependency=false): PIN to the safe version via
+               the ecosystem's override mechanism (npm overrides, yarn
+               resolutions, maven dependencyManagement, gradle constraints, go
+               replace, nuget CPM). `parentComponentPurls` is context only.
+        3. Stop after saving — do not run any package manager; do not fix other
+           issues unless the user explicitly asks.
 
         Args:
             ctx: MCP context used to prompt user selection.
@@ -710,6 +717,8 @@ def register_this(mcp: FastMCP) -> None:
                     "packageUrl": "pkg:npm/lodash@4.17.15",
                     "hash": "...",
                     "componentIdentifier": {...},
+                    "directDependency": true,            # from the IQ report
+                    "parentComponentPurls": [],          # parents if transitive
                     "issue": {
                         "reference": "sonatype-2024-3350",
                         "severity": 8.7,
@@ -738,6 +747,8 @@ def register_this(mcp: FastMCP) -> None:
                         "packageUrl": "pkg:npm/lodash@4.17.15",
                         "hash": "...",
                         "componentIdentifier": {...},
+                        "directDependency": true,                # from the IQ report
+                        "parentComponentPurls": [],              # parents if transitive
                         "issue": {"reference": "sonatype-2024-3350", "severity": 8.7, ...},
                         "vulnerability": {"recommendationMarkdown": "...", ...},
                         "latest_package_version": {"latest": "4.17.21", ...}  # may be null
@@ -772,21 +783,27 @@ def register_this(mcp: FastMCP) -> None:
         if not isinstance(selection, AcceptedElicitation):
             raise ValueError("Issue selection cancelled.")
 
-        # For transitive deps: prefer upgrading the direct parent over adding an override/exclude.
-        # Each ecosystem has a shell command to trace which direct dep pulls in the transitive one;
-        # upgrade that parent to its latest version so it brings in a safe transitive version.
+        # directDependency comes straight from the IQ report (component.dependencyData),
+        # so the model never has to shell out (npm ls / mvn dependency:tree) to find out.
+        # Direct deps: bump in the manifest. Transitive deps: pin to the safe version
+        # via the ecosystem's override mechanism (deterministic), not by guessing a parent bump.
         _TRANSITIVE_GUIDANCE = (
-            "If the package is TRANSITIVE (not declared directly): "
-            "DO NOT add an npm override, Maven exclusion, or similar workaround as a first resort. "
-            "Instead, find the direct parent that pulls it in using the ecosystem-appropriate command: "
-            "npm -> `npm ls <pkg>` or parse package-lock.json; "
-            "maven -> `mvn dependency:tree -Dincludes=group:artifact`; "
-            "go -> `go mod graph | grep <module>`; "
-            "pypi -> `pip show <pkg>` (check Required-by) or parse poetry.lock/Pipfile.lock; "
-            "nuget -> `dotnet list package --include-transitive`. "
-            "Then call get_latest_package_version on the parent and upgrade it — "
-            "the updated parent will pull in a safe version of the transitive dep. "
-            "Only fall back to an override/exclude if no parent upgrade resolves it. "
+            "Use the `directDependency` field to decide HOW to apply the fix — do NOT shell "
+            "out to discover it (it is already in the data). "
+            "IF directDependency is TRUE (declared directly): bump the package's version to the "
+            "safe version in its manifest "
+            "(npm->package.json, maven->pom.xml, gradle->build.gradle, golang->go.mod, "
+            "pypi->requirements.txt/pyproject.toml, nuget->*.csproj) and save. "
+            "IF directDependency is FALSE (transitive): the safe version is already known, so PIN it "
+            "deterministically using the ecosystem's override mechanism rather than editing a parent: "
+            "npm -> add/extend `overrides` in package.json; "
+            "yarn -> `resolutions` in package.json; "
+            "maven -> add the artifact to `<dependencyManagement>` with the safe version; "
+            "gradle -> a dependency constraint (e.g. `constraints { implementation('grp:art:safeVer') }`); "
+            "golang -> a `replace` directive in go.mod pinning the safe version; "
+            "pypi -> add the package explicitly (or a constraints.txt entry) pinned to the safe version; "
+            "nuget -> set the version centrally via Directory.Packages.props (CPM). "
+            "`parentComponentPurls` lists the direct parent(s) that pull it in, for context only. "
             "After editing any dependency file, STOP — do NOT run npm install, mvn install, "
             "go mod tidy, pip install, dotnet restore, or any other package manager command."
         )
@@ -803,11 +820,7 @@ def register_this(mcp: FastMCP) -> None:
 
         fix_all_instructions = (
             f"For each item in `issues`: {_VERSION_RESOLUTION} "
-            "Then: decode the dependency file from item.packageUrl: "
-            "npm->package.json, maven->pom.xml, golang->go.mod, pypi->requirements.txt, nuget->*.csproj. "
-            "Read that file and confirm the package is a DIRECT dependency. "
-            f"{_TRANSITIVE_GUIDANCE} "
-            "If direct, bump the version to the safe version and save the file. "
+            f"Then apply the fix based on item.directDependency: {_TRANSITIVE_GUIDANCE} "
             "Repeat for every item in the list."
         )
 
@@ -835,20 +848,15 @@ def register_this(mcp: FastMCP) -> None:
                 "packageUrl": enriched["packageUrl"],
                 "hash": enriched["hash"],
                 "componentIdentifier": enriched["componentIdentifier"],
+                "directDependency": enriched["directDependency"],
+                "parentComponentPurls": enriched["parentComponentPurls"],
                 "issue": enriched["issue"],
             },
             "vulnerability": enriched["vulnerability"],
             "latest_package_version": enriched["latest_package_version"],
             "next_action_for_assistant": (
                 f"1. {_VERSION_RESOLUTION} "
-                "2. Decode the dependency file from selected.packageUrl: "
-                "npm->package.json, maven->pom.xml, golang->go.mod, pypi->requirements.txt, nuget->*.csproj. "
-                "3. Read that file and confirm the affected package is declared as a DIRECT dependency. "
-                f"{_TRANSITIVE_GUIDANCE} "
-                "4. If it is direct, bump the version to the safe version and save the file. "
-                "STOP after saving — do NOT run any shell or package manager command whatsoever "
-                "(including npm install, npm install --package-lock-only, mvn install, "
-                "go mod tidy, pip install, dotnet restore, or any variant). "
+                f"2. Apply the fix based on selected.directDependency: {_TRANSITIVE_GUIDANCE} "
                 "Leave lockfile regeneration to the user. "
             ),
         }
