@@ -261,6 +261,77 @@ async def _select_single_report(
     return [reports[selected_index]]
 
 
+def _get_latest_package_version(package_url: str) -> dict:
+    """Core logic for querying Nexus Repository for the latest version of a package."""
+    if not _nexus_repo_client:
+        raise RuntimeError(
+            "NEXUS_REPO_BASE_URL is not set — cannot query Nexus Repository."
+        )
+
+    raw = package_url
+    if raw.startswith("pkg:"):
+        raw = raw[4:]
+    purl_type, _, rest = raw.partition("/")
+    purl_type = purl_type.lower()
+
+    _PURL_TO_NEXUS_FORMAT = {
+        "npm": "npm",
+        "maven": "maven2",
+        "golang": "go",
+        "go": "go",
+        "pypi": "pypi",
+        "nuget": "nuget",
+        "rubygems": "rubygems",
+        "composer": "composer",
+    }
+    fmt = _PURL_TO_NEXUS_FORMAT.get(purl_type, purl_type)
+
+    name_part = rest.rsplit("/", 1)[-1]
+    name, _, _ = name_part.partition("@")
+
+    resp = _nexus_repo_client.get(
+        "/service/rest/v1/search",
+        params={"format": fmt, "name": name, "sort": "version", "direction": "desc"},
+    )
+    if resp.status_code in (400, 404):
+        raise RuntimeError(
+            f"Nexus Repository returned {resp.status_code} for {fmt}/{name}."
+        )
+    resp.raise_for_status()
+
+    items = resp.json().get("items") or []
+    versions = list(dict.fromkeys(
+        item["version"] for item in items if item.get("version")
+    ))
+    if not versions:
+        raise RuntimeError(
+            f"No versions found in Nexus Repository for {fmt}/{name}."
+        )
+    return {"package": name, "format": fmt, "latest": versions[0], "versions": versions[:20]}
+
+
+def _try_get_latest_package_version(package_url: str) -> dict | None:
+    """Like _get_latest_package_version but returns None on any error."""
+    try:
+        return _get_latest_package_version(package_url)
+    except Exception:
+        return None
+
+
+def _enrich_issue_row(row: dict) -> dict:
+    """Attach full vulnerability details and the latest available package version to a flattened issue row."""
+    ref_id = row["issue"].get("reference")
+    vulnerability = _iq_get(f"/api/v2/vulnerabilities/{ref_id}") if ref_id else {}
+    return {
+        "packageUrl": row.get("packageUrl"),
+        "hash": row.get("hash"),
+        "componentIdentifier": row.get("componentIdentifier"),
+        "issue": row["issue"],
+        "vulnerability": vulnerability,
+        "latest_package_version": _try_get_latest_package_version(row.get("packageUrl") or ""),
+    }
+
+
 def _iq_get_maybe_404(url: str, params: dict | None = None) -> httpx.Response:
     """GET a Nexus IQ endpoint, but don't raise for 404."""
     resp = _iq_client.get(url, params=params)
@@ -334,8 +405,6 @@ def register_this(mcp: FastMCP) -> None:
     - find_application_by_public_id -> GitLab projectId -> IQ internal id
     - list_reports_for_aa           (chained) AA -> one selected report per project
     - list_reports                  -> /api/v2/reports/applications/{applicationId}
-    - get_report                    -> follow reportDataUrl from list_reports
-    - get_vulnerable_components     (filtered view of the raw report)
     - choose_issue_for_remediation  -> ask user to pick one issue from a report
     - get_vulnerability             -> /api/v2/vulnerabilities/{refId}
 
@@ -354,9 +423,8 @@ def register_this(mcp: FastMCP) -> None:
     Quick path (single-issue remediation):
         1. Read .git/config -> get remote origin URL
         2. list_reports_for_aa("AA47794") -> match origin URL to one project
-        3. get_vulnerable_components(reportDataUrl)  -> compact worklist
-        4. choose_issue_for_remediation(reportDataUrl) -> user selects one issue
-        5. Remediate only that selected issue
+        3. choose_issue_for_remediation(reportDataUrl) -> user selects one issue
+        4. Remediate only that selected issue
 
     Step-by-step path (model picks one project to drill into):
         1. Read .git/config -> get remote origin URL
@@ -578,44 +646,6 @@ def register_this(mcp: FastMCP) -> None:
 
 
     @mcp.tool()
-    async def list_reports(ctx: Context, application_id: str) -> list:
-        """
-        List all evaluation reports/scans for one Nexus IQ application.
-
-        Calls: GET /api/v2/reports/applications/{applicationId}
-
-        Args:
-            application_id: The application's INTERNAL id (the `id` field
-                from find_application_by_public_id, e.g.
-                "f81a5c32544e4d55be8a0d0651dd7145"). NOT the publicId.
-
-        Returns:
-            A list of report summaries. If multiple reports exist, the user is
-            prompted to manually choose one report to proceed and only the
-            selected report is returned. Each entry includes a `reportDataUrl`
-            (the path to the raw report) — pass that back into get_report or
-            get_vulnerable_components without parsing out a scan id. Typical
-            entry:
-            {
-                "stage": "build",           # build | stage-release | release | operate | ...
-                "applicationId": "f81a5c...",
-                "evaluationDate": "2026-05-01T10:42:15.212+01:00",
-                "latestReportHtmlUrl": "ui/links/application/.../latestReport/build",
-                "reportHtmlUrl": "ui/links/application/.../report/...",
-                "embeddableReportHtmlUrl": "ui/links/application/.../report/.../embeddable",
-                "reportPdfUrl": "ui/links/application/.../report/.../pdf",
-                "reportDataUrl": "api/v2/applications/.../reports/.../raw"
-            }
-        """
-        reports = _get_sorted_reports(application_id)
-        return await _select_single_report(
-            ctx,
-            reports,
-            prompt_subject=f"Application {application_id}",
-        )
-
-
-    @mcp.tool()
     def get_latest_report(application_id: str, stage: str | None = "release") -> dict:
         """Return the newest report for an app, optionally filtered by stage.
 
@@ -649,111 +679,6 @@ def register_this(mcp: FastMCP) -> None:
 
 
     @mcp.tool()
-    def get_report(report_data_url: str) -> dict:
-        """
-        Fetch the raw scan report by following a reportDataUrl returned from
-        list_reports.
-
-        Args:
-            report_data_url: The `reportDataUrl` field from a list_reports
-                entry. Accepts relative ("api/v2/applications/.../raw") or
-                absolute ("https://it4it-nexus-iq-uat.swissbank.com/api/v2/...") forms.
-                Absolute URLs must point at the configured IQ host.
-
-        Returns:
-            The raw report JSON. Components live under `components[]`, each
-            with `securityData.securityIssues[]` whose `reference` field is
-            the refId you pass to get_vulnerability().
-        """
-        return _fetch_raw_report(report_data_url)
-
-    @mcp.tool()
-    def get_vulnerable_components(report_data_url: str) -> dict:
-        """
-        Fetch a raw report and return a pre-ranked summary of vulnerable issues.
-
-        Only includes issues with severity >= 7.0 OR threatCategory in
-        ("critical", "severe"). Lower-severity issues are counted but omitted
-        from top_issues unless the user explicitly asks for them.
-
-        Do NOT run your own Python/scripts to re-parse the report after calling
-        this tool — the ranking and filtering is already done. Show top_issues
-        to the user, ask which one to fix, then call choose_issue_for_remediation.
-
-        Args:
-            report_data_url: The `reportDataUrl` from a list_reports entry.
-
-        Returns:
-            {
-                "report_data_url": "...",
-                "total_vulnerable_components": 12,
-                "high_severity_issue_count": 5,
-                "top_issues": [
-                    {
-                        "rank": 1,
-                        "severity": 9.8,
-                        "threat_category": "critical",
-                        "reference": "CVE-2021-44228",
-                        "source": "nvd",
-                        "package": "pkg:maven/org.apache.logging.log4j/log4j-core@2.14.1",
-                        "status": "Open"
-                    },
-                    ...
-                ],
-                "next_action_for_assistant": "..."
-            }
-        """
-        report = _fetch_raw_report(report_data_url)
-
-        _HIGH_CATEGORIES = {"critical", "severe"}
-
-        # Flatten to one row per issue, deduplicate by reference keeping max severity.
-        best: dict[str, dict] = {}
-        total_vulnerable = 0
-
-        for component in report.get("components", []):
-            sec = component.get("securityData") or {}
-            issues = sec.get("securityIssues") or []
-            if not issues:
-                continue
-            total_vulnerable += 1
-            pkg_url = component.get("packageUrl") or ""
-            for issue in issues:
-                ref = issue.get("reference") or ""
-                sev = issue.get("severity") or 0
-                tc = (issue.get("threatCategory") or "").lower()
-                if sev < 7.0 and tc not in _HIGH_CATEGORIES:
-                    continue
-                if ref not in best or sev > best[ref]["severity"]:
-                    best[ref] = {
-                        "reference": ref,
-                        "severity": sev,
-                        "threat_category": tc,
-                        "source": issue.get("source") or "",
-                        "status": issue.get("status") or "",
-                        "package": pkg_url,
-                    }
-
-        ranked = sorted(best.values(), key=lambda r: r["severity"], reverse=True)
-        top_issues = [{"rank": i + 1, **row} for i, row in enumerate(ranked)]
-
-        return {
-            "report_data_url": report_data_url,
-            "total_vulnerable_components": total_vulnerable,
-            "high_severity_issue_count": len(top_issues),
-            "top_issues": top_issues,
-            "next_action_for_assistant": (
-                "Show top_issues to the user ranked by severity. "
-                "For each issue: call get_latest_package_version(packageUrl) if "
-                "recommendationMarkdown has no fixed version, then read the dependency "
-                "file and bump the version. Do not run npm/shell commands to find versions — "
-                "use get_latest_package_version instead."
-            ),
-        }
-
-
-
-    @mcp.tool()
     async def choose_issue_for_remediation(ctx: Context, report_data_url: str) -> dict:
         """
         Fetch one report, ask the user to pick exactly one vulnerability issue,
@@ -778,10 +703,15 @@ def register_this(mcp: FastMCP) -> None:
             report_data_url: The `reportDataUrl` from list_reports/list_reports_for_aa.
 
         Returns:
+            The shape depends on the user's selection (`mode`).
+
+            mode == "fix_one" (user picked a single issue):
             {
                 "report_data_url": "...",
+                "mode": "fix_one",
                 "selected": {
                     "packageUrl": "pkg:npm/lodash@4.17.15",
+                    "hash": "...",
                     "componentIdentifier": {...},
                     "issue": {
                         "reference": "sonatype-2024-3350",
@@ -793,6 +723,30 @@ def register_this(mcp: FastMCP) -> None:
                     "recommendationMarkdown": "Upgrade to lodash >= 4.17.21 ...",
                     ...
                 },
+                "latest_package_version": {        # pre-fetched fallback; may be null
+                    "package": "lodash",
+                    "format": "npm",
+                    "latest": "4.17.21",
+                    "versions": ["4.17.21", "4.17.20", ...]
+                },
+                "next_action_for_assistant": "..."
+            }
+
+            mode == "fix_all" (user chose to remediate every issue):
+            {
+                "report_data_url": "...",
+                "mode": "fix_all",
+                "issues": [
+                    {
+                        "packageUrl": "pkg:npm/lodash@4.17.15",
+                        "hash": "...",
+                        "componentIdentifier": {...},
+                        "issue": {"reference": "sonatype-2024-3350", "severity": 8.7, ...},
+                        "vulnerability": {"recommendationMarkdown": "...", ...},
+                        "latest_package_version": {"latest": "4.17.21", ...}  # may be null
+                    },
+                    ...
+                ],
                 "next_action_for_assistant": "..."
             }
         """
@@ -846,8 +800,8 @@ def register_this(mcp: FastMCP) -> None:
             "STEP A: Read vulnerability.recommendationMarkdown. "
             "If it contains a specific version (e.g. 'upgrade to >= 4.17.21' or 'use 3.2.0+'), use that version. "
             "STEP B (fallback only): If recommendationMarkdown is empty or contains no version number, "
-            "call get_latest_package_version(packageUrl) and use the returned latest version. "
-            "Do NOT call get_latest_package_version if STEP A already gave a version."
+            "use the `latest_package_version.latest` field already present in the returned data — "
+            "it was pre-fetched for you. Do NOT call get_latest_package_version again."
         )
 
         fix_all_instructions = (
@@ -861,21 +815,10 @@ def register_this(mcp: FastMCP) -> None:
         )
 
         if selection.data == "all":
-            issues_with_vulns = []
-            for row in rows:
-                ref_id = row["issue"].get("reference")
-                vulnerability = _iq_get(f"/api/v2/vulnerabilities/{ref_id}") if ref_id else {}
-                issues_with_vulns.append({
-                    "packageUrl": row.get("packageUrl"),
-                    "hash": row.get("hash"),
-                    "componentIdentifier": row.get("componentIdentifier"),
-                    "issue": row["issue"],
-                    "vulnerability": vulnerability,
-                })
             return {
                 "report_data_url": report_data_url,
                 "mode": "fix_all",
-                "issues": issues_with_vulns,
+                "issues": [_enrich_issue_row(row) for row in rows],
                 "next_action_for_assistant": fix_all_instructions,
             }
 
@@ -884,22 +827,21 @@ def register_this(mcp: FastMCP) -> None:
             raise ValueError("Invalid issue selection.")
 
         selected = rows[selected_index]
-        issue = selected["issue"]
-        ref_id = issue.get("reference")
-        if not ref_id:
+        if not selected["issue"].get("reference"):
             raise RuntimeError("Selected issue has no reference/refId.")
 
-        vulnerability = _iq_get(f"/api/v2/vulnerabilities/{ref_id}")
+        enriched = _enrich_issue_row(selected)
         return {
             "report_data_url": report_data_url,
             "mode": "fix_one",
             "selected": {
-                "packageUrl": selected.get("packageUrl"),
-                "hash": selected.get("hash"),
-                "componentIdentifier": selected.get("componentIdentifier"),
-                "issue": issue,
+                "packageUrl": enriched["packageUrl"],
+                "hash": enriched["hash"],
+                "componentIdentifier": enriched["componentIdentifier"],
+                "issue": enriched["issue"],
             },
-            "vulnerability": vulnerability,
+            "vulnerability": enriched["vulnerability"],
+            "latest_package_version": enriched["latest_package_version"],
             "next_action_for_assistant": (
                 f"1. {_VERSION_RESOLUTION} "
                 "2. Decode the dependency file from selected.packageUrl: "
@@ -913,25 +855,6 @@ def register_this(mcp: FastMCP) -> None:
                 "Leave lockfile regeneration to the user. "
             ),
         }
-    
-    @mcp.tool()
-    def get_vulnerability(ref_id: str) -> dict:
-        """
-        Fetch details for a single vulnerability by its reference ID.
-
-        Calls: GET /api/v2/vulnerabilities/{refId}
-
-        The returned payload typically contains description / explanation /
-        detection / recommendation Markdown fields, plus CVSS scoring and
-        CWE metadata. The recommendationMarkdown field is the main thing
-        the LLM should use to draft a remediation suggestion.
-
-        Args:
-            ref_id: The vulnerability reference, e.g. "CVE-2021-44228" or
-                "sonatype-2024-3350". This is the `reference` value found
-                inside securityData.securityIssues[] in the scan report.
-        """
-        return _iq_get(f"/api/v2/vulnerabilities/{ref_id}")
 
     @mcp.tool()
     def get_latest_package_version(package_url: str) -> dict:
@@ -956,59 +879,4 @@ def register_this(mcp: FastMCP) -> None:
                 "latest": "4.17.21"
             }
         """
-        if not _nexus_repo_client:
-            raise RuntimeError(
-                "NEXUS_REPO_BASE_URL is not set — cannot query Nexus Repository."
-            )
-
-        # Parse purl: pkg:format/[group/]name@version
-        # Strip leading "pkg:" then split on "/" and "@"
-        raw = package_url
-        if raw.startswith("pkg:"):
-            raw = raw[4:]
-        purl_type, _, rest = raw.partition("/")
-        purl_type = purl_type.lower()
-
-        # Map purl type -> Nexus Repository format param
-        _PURL_TO_NEXUS_FORMAT = {
-            "npm": "npm",
-            "maven": "maven2",
-            "golang": "go",
-            "go": "go",
-            "pypi": "pypi",
-            "nuget": "nuget",
-            "rubygems": "rubygems",
-            "composer": "composer",
-        }
-        fmt = _PURL_TO_NEXUS_FORMAT.get(purl_type, purl_type)
-
-        # rest may be "group/name@version" or "name@version" (golang has long paths)
-        name_part = rest.rsplit("/", 1)[-1]  # take last path segment
-        name, _, _ = name_part.partition("@")
-
-        resp = _nexus_repo_client.get(
-            "/service/rest/v1/search",
-            params={"format": fmt, "name": name, "sort": "version", "direction": "desc"},
-        )
-        if resp.status_code == 404 or resp.status_code == 400:
-            raise RuntimeError(
-                f"Nexus Repository returned {resp.status_code} for {fmt}/{name}."
-            )
-        resp.raise_for_status()
-
-        items = resp.json().get("items") or []
-        versions = list(dict.fromkeys(
-            item["version"] for item in items if item.get("version")
-        ))
-
-        if not versions:
-            raise RuntimeError(
-                f"No versions found in Nexus Repository for {fmt}/{name}."
-            )
-
-        return {
-            "package": name,
-            "format": fmt,
-            "latest": versions[0],
-            "versions": versions[:20],
-        }
+        return _get_latest_package_version(package_url)
