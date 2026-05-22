@@ -217,14 +217,15 @@ def _short_package_name(package_url: str | None) -> str:
     return raw.rsplit("/", 1)[-1]                # take last segment for maven group paths
 
 
-def _issue_choice_title(row: dict) -> str:
-    issue = row["issue"]
-    severity = issue.get("severity")
-    label = _severity_label(severity)
-    score = f"{severity:.1f}" if severity is not None else "?"
-    reference = issue.get("reference") or "unknown-ref"
-    pkg = _short_package_name(row.get("packageUrl"))
-    return f"[{label} {score}]  {reference}  —  {pkg}"
+def _package_choice_title(package_url: str, pkg_rows: list[dict]) -> str:
+    """Build a concise label for a package aggregating all its CVEs."""
+    max_sev = max(_severity_score(r["issue"]) for r in pkg_rows)
+    label = _severity_label(max_sev)
+    score = f"{max_sev:.1f}"
+    pkg = _short_package_name(package_url)
+    refs = ", ".join(r["issue"].get("reference") or "?" for r in pkg_rows[:3])
+    extra = f" +{len(pkg_rows) - 3} more" if len(pkg_rows) > 3 else ""
+    return f"[{label} {score}]  {pkg}  —  {len(pkg_rows)} CVE(s): {refs}{extra}"
 
 
 def _get_sorted_reports(application_id: str) -> list[dict]:
@@ -680,13 +681,10 @@ def register_this(mcp: FastMCP) -> None:
         """
         Use this to get remediation info for a report's vulnerabilities.
 
-        Fetches one report, asks the user to pick exactly one vulnerability issue
-        (or choose "Fix ALL"), then returns the selected issue(s) enriched with
-        full vulnerability details, the latest available package version, and
-        step-by-step remediation instructions for the assistant.
-
-        Use this before remediation so the user controls whether one issue or
-        every issue in the report gets fixed.
+        Fetches one report, groups vulnerabilities by package, and asks the user
+        to pick a package (fixing all its CVEs) or "Fix ALL". Returns enriched
+        issue(s) with full vulnerability details, latest available package
+        version, and step-by-step remediation instructions for the assistant.
 
         After calling this tool, follow these steps to remediate:
         1. Determine the safe version (recommendationMarkdown, else
@@ -700,7 +698,7 @@ def register_this(mcp: FastMCP) -> None:
                resolutions, maven dependencyManagement, gradle constraints, go
                replace, nuget CPM). `parentComponentPurls` is context only.
         3. Stop after saving — do not run any package manager; do not fix other
-           issues unless the user explicitly asks.
+           packages unless the user explicitly asks.
 
         Args:
             ctx: MCP context used to prompt user selection.
@@ -709,36 +707,28 @@ def register_this(mcp: FastMCP) -> None:
         Returns:
             The shape depends on the user's selection (`mode`).
 
-            mode == "fix_one" (user picked a single issue):
+            mode == "fix_package" (user picked one package — all its CVEs):
             {
                 "report_data_url": "...",
-                "mode": "fix_one",
-                "selected": {
-                    "packageUrl": "pkg:npm/lodash@4.17.15",
-                    "hash": "...",
-                    "componentIdentifier": {...},
-                    "directDependency": true,            # from the IQ report
-                    "parentComponentPurls": [],          # parents if transitive
-                    "issue": {
-                        "reference": "sonatype-2024-3350",
-                        "severity": 8.7,
-                        ...
-                    }
-                },
-                "vulnerability": {
-                    "recommendationMarkdown": "Upgrade to lodash >= 4.17.21 ...",
-                    ...
-                },
-                "latest_package_version": {        # pre-fetched fallback; may be null
-                    "package": "lodash",
-                    "format": "npm",
-                    "latest": "4.17.21",
-                    "versions": ["4.17.21", "4.17.20", ...]
-                },
+                "mode": "fix_package",
+                "packageUrl": "pkg:npm/lodash@4.17.15",
+                "issues": [
+                    {
+                        "packageUrl": "pkg:npm/lodash@4.17.15",
+                        "hash": "...",
+                        "componentIdentifier": {...},
+                        "directDependency": true,
+                        "parentComponentPurls": [],
+                        "issue": {"reference": "sonatype-2024-3350", "severity": 8.7, ...},
+                        "vulnerability": {"recommendationMarkdown": "Upgrade to lodash >= 4.17.21 ...", ...},
+                        "latest_package_version": {"latest": "4.17.21", ...}  # may be null
+                    },
+                    ...  # all CVEs for this package
+                ],
                 "next_action_for_assistant": "..."
             }
 
-            mode == "fix_all" (user chose to remediate every issue):
+            mode == "fix_all" (user chose to remediate every CVE across all packages):
             {
                 "report_data_url": "...",
                 "mode": "fix_all",
@@ -747,8 +737,8 @@ def register_this(mcp: FastMCP) -> None:
                         "packageUrl": "pkg:npm/lodash@4.17.15",
                         "hash": "...",
                         "componentIdentifier": {...},
-                        "directDependency": true,                # from the IQ report
-                        "parentComponentPurls": [],              # parents if transitive
+                        "directDependency": true,
+                        "parentComponentPurls": [],
                         "issue": {"reference": "sonatype-2024-3350", "severity": 8.7, ...},
                         "vulnerability": {"recommendationMarkdown": "...", ...},
                         "latest_package_version": {"latest": "4.17.21", ...}  # may be null
@@ -765,17 +755,29 @@ def register_this(mcp: FastMCP) -> None:
                 "No vulnerable issues found in report. Nothing to remediate."
             )
 
+        # Group rows by packageUrl; preserve severity-sorted order within each package.
+        pkg_map: dict[str, list[dict]] = {}
+        for row in rows:
+            key = row.get("packageUrl") or "unknown"
+            pkg_map.setdefault(key, []).append(row)
+
+        sorted_pkgs = sorted(
+            pkg_map.items(),
+            key=lambda kv: max(_severity_score(r["issue"]) for r in kv[1]),
+            reverse=True,
+        )
+
         choices = {
-            "all": {"title": f"Fix ALL {len(rows)} issues"},
+            "all": {"title": f"Fix ALL {len(rows)} CVEs across {len(sorted_pkgs)} package(s)"},
             **{
-                str(idx): {"title": _issue_choice_title(row)}
-                for idx, row in enumerate(rows, start=1)
+                str(idx): {"title": _package_choice_title(pkg_url, pkg_rows)}
+                for idx, (pkg_url, pkg_rows) in enumerate(sorted_pkgs, start=1)
             },
         }
         selection = await ctx.elicit(
             (
-                f"Report has {len(rows)} vulnerable issue(s). "
-                "Choose one issue to remediate, or choose 'Fix ALL' to remediate every issue."
+                f"Report has {len(rows)} CVE(s) across {len(sorted_pkgs)} package(s). "
+                "Choose a package to fix all its CVEs, or choose 'Fix ALL' to remediate every CVE."
             ),
             choices,
         )
@@ -818,7 +820,7 @@ def register_this(mcp: FastMCP) -> None:
             "it was pre-fetched for you. Do NOT call get_latest_package_version again."
         )
 
-        fix_all_instructions = (
+        multi_issue_instructions = (
             f"For each item in `issues`: {_VERSION_RESOLUTION} "
             f"Then apply the fix based on item.directDependency: {_TRANSITIVE_GUIDANCE} "
             "Repeat for every item in the list."
@@ -829,59 +831,18 @@ def register_this(mcp: FastMCP) -> None:
                 "report_data_url": report_data_url,
                 "mode": "fix_all",
                 "issues": [_enrich_issue_row(row) for row in rows],
-                "next_action_for_assistant": fix_all_instructions,
+                "next_action_for_assistant": multi_issue_instructions,
             }
 
         selected_index = int(selection.data) - 1
-        if selected_index < 0 or selected_index >= len(rows):
-            raise ValueError("Invalid issue selection.")
+        if selected_index < 0 or selected_index >= len(sorted_pkgs):
+            raise ValueError("Invalid package selection.")
 
-        selected = rows[selected_index]
-        if not selected["issue"].get("reference"):
-            raise RuntimeError("Selected issue has no reference/refId.")
-
-        enriched = _enrich_issue_row(selected)
+        pkg_url, pkg_rows = sorted_pkgs[selected_index]
         return {
             "report_data_url": report_data_url,
-            "mode": "fix_one",
-            "selected": {
-                "packageUrl": enriched["packageUrl"],
-                "hash": enriched["hash"],
-                "componentIdentifier": enriched["componentIdentifier"],
-                "directDependency": enriched["directDependency"],
-                "parentComponentPurls": enriched["parentComponentPurls"],
-                "issue": enriched["issue"],
-            },
-            "vulnerability": enriched["vulnerability"],
-            "latest_package_version": enriched["latest_package_version"],
-            "next_action_for_assistant": (
-                f"1. {_VERSION_RESOLUTION} "
-                f"2. Apply the fix based on selected.directDependency: {_TRANSITIVE_GUIDANCE} "
-                "Leave lockfile regeneration to the user. "
-            ),
+            "mode": "fix_package",
+            "packageUrl": pkg_url,
+            "issues": [_enrich_issue_row(row) for row in pkg_rows],
+            "next_action_for_assistant": multi_issue_instructions,
         }
-
-    @mcp.tool()
-    def get_latest_package_version(package_url: str) -> dict:
-        """
-        Query the internal Nexus Repository Manager for available versions of a
-        package. Use this when recommendationMarkdown does not specify a fixed
-        version — find the latest available version internally and use that.
-
-        Requires NEXUS_REPO_BASE_URL to be set.
-
-        Args:
-            package_url: The purl from selected.packageUrl, e.g.:
-                "pkg:npm/lodash@4.17.15"
-                "pkg:maven/org.apache.commons/commons-lang3@3.12.0"
-                "pkg:pypi/requests@2.28.0"
-
-        Returns:
-            {
-                "package": "lodash",
-                "format": "npm",
-                "versions": ["4.17.21", "4.17.20", ...],
-                "latest": "4.17.21"
-            }
-        """
-        return _get_latest_package_version(package_url)
