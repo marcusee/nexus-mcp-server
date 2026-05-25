@@ -250,40 +250,59 @@ def _try_get_latest_package_version(package_url: str) -> dict | None:
         return None
 
 
-# Fields kept from the /api/v2/vulnerabilities/{refId} payload. The rest is
-# structured metadata the remediation flow never reads, and it multiplies in
-# fix_all mode (one full payload per issue), so we whitelist down to signal.
-_VULN_KEEP_FIELDS = (
-    "recommendationMarkdown",
-    "description",
-    "explanationMarkdown",
-    "mainSeverity",
-    "identifier",
-    "vulnIds",
-    "vulnerabilityLink",
-    "advisories",
-)
+def _purl_version(package_url: str | None) -> str | None:
+    """Extract the version from a purl, e.g. pkg:npm/lodash@4.17.15 -> 4.17.15."""
+    if not package_url:
+        return None
+    name_part = package_url.rsplit("/", 1)[-1]   # lodash@4.17.15 or name@ver
+    return name_part.rsplit("@", 1)[-1] if "@" in name_part else None
 
 
-def _slim_vulnerability(vuln: dict) -> dict:
-    """Whitelist the vulnerability payload down to the fields remediation actually uses."""
-    return {key: vuln[key] for key in _VULN_KEEP_FIELDS if key in vuln}
+def _issue_detail(row: dict) -> dict:
+    """One CVE, trimmed to what's needed to choose a safe version.
 
-
-def _enrich_issue_row(row: dict) -> dict:
-    """Attach trimmed vulnerability details and the latest available package version to a flattened issue row."""
+    The full /api/v2/vulnerabilities/{refId} payload is mostly structured
+    metadata remediation never reads, and it multiplies in fix_all mode, so we
+    keep only the recommendation text and a reference link.
+    """
     ref_id = row["issue"].get("reference")
-    vulnerability = _iq_get(f"/api/v2/vulnerabilities/{ref_id}") if ref_id else {}
+    vuln = _iq_get(f"/api/v2/vulnerabilities/{ref_id}") if ref_id else {}
     return {
         "packageUrl": row.get("packageUrl"),
-        "hash": row.get("hash"),
-        "componentIdentifier": row.get("componentIdentifier"),
-        "directDependency": row.get("directDependency"),
-        "parentComponentPurls": row.get("parentComponentPurls") or [],
-        "issue": row["issue"],
-        "vulnerability": _slim_vulnerability(vulnerability),
-        "latest_package_version": _try_get_latest_package_version(row.get("packageUrl") or ""),
+        "reference": ref_id,
+        "severity": row["issue"].get("severity"),
+        "recommendationMarkdown": vuln.get("recommendationMarkdown"),
+        "vulnerabilityLink": vuln.get("vulnerabilityLink"),
     }
+
+
+def _summarize_packages(rows: list[dict]) -> list[dict]:
+    """Collapse CVE rows into one actionable entry per package, severity-sorted.
+
+    This is the table a remediating agent needs to edit a manifest (current vs.
+    latest version, direct/transitive). latestVersion is looked up once per
+    package, not per CVE.
+    """
+    by_pkg: dict[str, dict] = {}
+    for row in rows:
+        purl = row.get("packageUrl") or "unknown"
+        sev = _severity_score(row["issue"])
+        entry = by_pkg.get(purl)
+        if entry is None:
+            by_pkg[purl] = {
+                "packageUrl": purl,
+                "name": _short_package_name(purl).rsplit("@", 1)[0],
+                "currentVersion": _purl_version(purl),
+                "latestVersion": (_try_get_latest_package_version(purl) or {}).get("latest"),
+                "directDependency": row.get("directDependency"),
+                "parentComponentPurls": row.get("parentComponentPurls") or [],
+                "maxSeverity": sev,
+                "cveCount": 1,
+            }
+        else:
+            entry["maxSeverity"] = max(entry["maxSeverity"], sev)
+            entry["cveCount"] += 1
+    return sorted(by_pkg.values(), key=lambda e: e["maxSeverity"], reverse=True)
 
 
 def _iq_get_maybe_404(url: str, params: dict | None = None) -> httpx.Response:
@@ -615,14 +634,15 @@ def register_this(mcp: FastMCP) -> None:
         Use this to get remediation info for a report's vulnerabilities.
 
         Fetches one report, groups vulnerabilities by package, and asks the user
-        to pick a package (fixing all its CVEs) or "Fix ALL". Returns enriched
-        issue(s) with full vulnerability details, latest available package
-        version, and step-by-step remediation instructions for the assistant.
+        to pick a package (fixing all its CVEs) or "Fix ALL". Returns a compact
+        per-package table (`packages`) plus trimmed per-CVE detail (`issues`) and
+        step-by-step remediation instructions for the assistant.
 
         After calling this tool, follow these steps to remediate:
-        1. Determine the safe version (recommendationMarkdown, else
-           latest_package_version.latest — see next_action_for_assistant).
-        2. Apply the fix based on `directDependency` (already in the data):
+        1. Determine the safe version per package: prefer a version named in the
+           package's CVE recommendationMarkdown (in `issues`), else use the
+           package's `latestVersion` (see next_action_for_assistant).
+        2. Apply the fix based on `directDependency` (already in `packages`):
              - direct: bump the package's version in its manifest
                (npm->package.json, maven->pom.xml, golang->go.mod,
                 pypi->requirements.txt/pyproject.toml, nuget->*.csproj).
@@ -638,43 +658,32 @@ def register_this(mcp: FastMCP) -> None:
             report_data_url: The `reportDataUrl` from list_reports.
 
         Returns:
-            The shape depends on the user's selection (`mode`).
-
-            mode == "fix_package" (user picked one package — all its CVEs):
-            {
-                "report_data_url": "...",
-                "mode": "fix_package",
-                "packageUrl": "pkg:npm/lodash@4.17.15",
-                "issues": [
-                    {
-                        "packageUrl": "pkg:npm/lodash@4.17.15",
-                        "hash": "...",
-                        "componentIdentifier": {...},
-                        "directDependency": true,
-                        "parentComponentPurls": [],
-                        "issue": {"reference": "sonatype-2024-3350", "severity": 8.7, ...},
-                        "vulnerability": {"recommendationMarkdown": "Upgrade to lodash >= 4.17.21 ...", ...},
-                        "latest_package_version": {"latest": "4.17.21", ...}  # may be null
-                    },
-                    ...  # all CVEs for this package
-                ],
-                "next_action_for_assistant": "..."
-            }
-
-            mode == "fix_all" (user chose to remediate every CVE across all packages):
+            `mode` is "fix_package" (one package's CVEs) or "fix_all" (every
+            package). "fix_package" also carries the selected `packageUrl`.
+            Otherwise both modes share the same shape:
             {
                 "report_data_url": "...",
                 "mode": "fix_all",
-                "issues": [
+                "packages": [                       # actionable table, severity-sorted
                     {
                         "packageUrl": "pkg:npm/lodash@4.17.15",
-                        "hash": "...",
-                        "componentIdentifier": {...},
+                        "name": "lodash",
+                        "currentVersion": "4.17.15",
+                        "latestVersion": "4.17.21",     # may be null
                         "directDependency": true,
                         "parentComponentPurls": [],
-                        "issue": {"reference": "sonatype-2024-3350", "severity": 8.7, ...},
-                        "vulnerability": {"recommendationMarkdown": "...", ...},
-                        "latest_package_version": {"latest": "4.17.21", ...}  # may be null
+                        "maxSeverity": 8.7,
+                        "cveCount": 3
+                    },
+                    ...
+                ],
+                "issues": [                         # per-CVE detail, keyed by packageUrl
+                    {
+                        "packageUrl": "pkg:npm/lodash@4.17.15",
+                        "reference": "sonatype-2024-3350",
+                        "severity": 8.7,
+                        "recommendationMarkdown": "Upgrade to lodash >= 4.17.21 ...",  # may be null
+                        "vulnerabilityLink": "..."      # may be null
                     },
                     ...
                 ],
@@ -701,7 +710,7 @@ def register_this(mcp: FastMCP) -> None:
         )
 
         choices = {
-            "all": {"title": f"Fix ALL {len(rows)} CVEs across {len(sorted_pkgs)} package(s)"},
+            "all": {"title": f"Fix ALL {len(sorted_pkgs)} package(s)"},
             **{
                 str(idx): {"title": _package_choice_title(pkg_url, pkg_rows)}
                 for idx, (pkg_url, pkg_rows) in enumerate(sorted_pkgs, start=1)
@@ -744,26 +753,29 @@ def register_this(mcp: FastMCP) -> None:
         )
 
         _VERSION_RESOLUTION = (
-            "To determine the safe version to upgrade to, follow this priority order — "
+            "To determine the safe version to upgrade a package to, follow this priority order — "
             "stop at the first step that gives a concrete version number: "
-            "STEP A: Read vulnerability.recommendationMarkdown. "
-            "If it contains a specific version (e.g. 'upgrade to >= 4.17.21' or 'use 3.2.0+'), use that version. "
-            "STEP B (fallback only): If recommendationMarkdown is empty or contains no version number, "
-            "use the `latest_package_version.latest` field already present in the returned data — "
-            "it was pre-fetched for you. Do NOT call get_latest_package_version again."
+            "STEP A: Read the recommendationMarkdown of that package's CVEs in `issues` "
+            "(match on packageUrl). If any states a specific version "
+            "(e.g. 'upgrade to >= 4.17.21' or 'use 3.2.0+'), use the highest such version. "
+            "STEP B (fallback only): If no recommendationMarkdown gives a version, use the "
+            "`latestVersion` field on the package entry — it was pre-fetched for you. "
+            "Do NOT call get_latest_package_version again."
         )
 
         multi_issue_instructions = (
-            f"For each item in `issues`: {_VERSION_RESOLUTION} "
-            f"Then apply the fix based on item.directDependency: {_TRANSITIVE_GUIDANCE} "
-            "Repeat for every item in the list."
+            "Work through `packages` (already sorted by severity). For each package entry: "
+            f"{_VERSION_RESOLUTION} "
+            f"Then apply the fix based on the package's directDependency: {_TRANSITIVE_GUIDANCE} "
+            "`issues` holds the per-CVE recommendation detail; `packages` is the actionable table."
         )
 
         if selection.data == "all":
             return {
                 "report_data_url": report_data_url,
                 "mode": "fix_all",
-                "issues": [_enrich_issue_row(row) for row in rows],
+                "packages": _summarize_packages(rows),
+                "issues": [_issue_detail(row) for row in rows],
                 "next_action_for_assistant": multi_issue_instructions,
             }
 
@@ -776,6 +788,7 @@ def register_this(mcp: FastMCP) -> None:
             "report_data_url": report_data_url,
             "mode": "fix_package",
             "packageUrl": pkg_url,
-            "issues": [_enrich_issue_row(row) for row in pkg_rows],
+            "packages": _summarize_packages(pkg_rows),
+            "issues": [_issue_detail(row) for row in pkg_rows],
             "next_action_for_assistant": multi_issue_instructions,
         }
