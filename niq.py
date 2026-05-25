@@ -279,9 +279,10 @@ def _issue_detail(row: dict) -> dict:
 def _summarize_packages(rows: list[dict]) -> list[dict]:
     """Collapse CVE rows into one actionable entry per package, severity-sorted.
 
-    This is the table a remediating agent needs to edit a manifest (current vs.
-    latest version, direct/transitive). latestVersion is looked up once per
-    package, not per CVE.
+    This is the table a remediating agent needs to edit a manifest: current
+    version vs. the versions actually available in the org's Nexus Repository
+    (so it can choose a same-major upgrade), plus direct/transitive. Versions
+    are looked up once per package, not per CVE.
     """
     by_pkg: dict[str, dict] = {}
     for row in rows:
@@ -293,7 +294,7 @@ def _summarize_packages(rows: list[dict]) -> list[dict]:
                 "packageUrl": purl,
                 "name": _short_package_name(purl).rsplit("@", 1)[0],
                 "currentVersion": _purl_version(purl),
-                "latestVersion": (_try_get_latest_package_version(purl) or {}).get("latest"),
+                "availableVersions": (_try_get_latest_package_version(purl) or {}).get("versions") or [],
                 "directDependency": row.get("directDependency"),
                 "parentComponentPurls": row.get("parentComponentPurls") or [],
                 "maxSeverity": sev,
@@ -639,10 +640,11 @@ def register_this(mcp: FastMCP) -> None:
         step-by-step remediation instructions for the assistant.
 
         After calling this tool, follow these steps to remediate:
-        1. Determine the safe version per package: prefer a version named in the
-           package's CVE recommendationMarkdown (in `issues`), else use the
-           package's `latestVersion` — the latest version from the organization's
-           repository (see next_action_for_assistant).
+        1. Determine the version per package: find the minimum fix version in the
+           package's CVE recommendationMarkdown (in `issues`), then pick a real
+           version from the package's `availableVersions` (what's in the org's
+           repository), preferring a same-major bump to avoid breakage (see
+           next_action_for_assistant).
         2. Apply the fix based on `directDependency` (already in `packages`):
              - direct: bump the package's version in its manifest
                (npm->package.json, maven->pom.xml, golang->go.mod,
@@ -670,7 +672,7 @@ def register_this(mcp: FastMCP) -> None:
                         "packageUrl": "pkg:npm/lodash@4.17.15",
                         "name": "lodash",
                         "currentVersion": "4.17.15",
-                        "latestVersion": "4.17.21",     # may be null
+                        "availableVersions": ["4.17.21", "4.17.20", ...],  # org repo, newest first
                         "directDependency": true,
                         "parentComponentPurls": [],
                         "maxSeverity": 8.7,
@@ -754,15 +756,18 @@ def register_this(mcp: FastMCP) -> None:
         )
 
         _VERSION_RESOLUTION = (
-            "To determine the safe version to upgrade a package to, follow this priority order — "
-            "stop at the first step that gives a concrete version number: "
-            "STEP A: Read the recommendationMarkdown of that package's CVEs in `issues` "
-            "(match on packageUrl). If any states a specific version "
-            "(e.g. 'upgrade to >= 4.17.21' or 'use 3.2.0+'), use the highest such version. "
-            "STEP B (fallback only): If no recommendationMarkdown gives a version, use the "
-            "`latestVersion` field on the package entry — it is the latest version from the "
-            "organization's repository, pre-fetched for you. Do NOT look up versions elsewhere; "
-            "if latestVersion is null, use the get_latest_package_version tool."
+            "To determine the version to upgrade a package to: "
+            "STEP A (minimum safe version): Read the recommendationMarkdown of that package's "
+            "CVEs in `issues` (match on packageUrl) for the lowest version that fixes the issue "
+            "(e.g. 'upgrade to >= 4.17.21' or 'use 3.2.0+'). "
+            "STEP B (pick from what's actually available): `availableVersions` lists the versions "
+            "in the organization's repository (newest first) — choose the version to pin from "
+            "THIS list, do NOT look up versions elsewhere. Prefer the newest version that "
+            "satisfies STEP A while keeping the package's current MAJOR version (see "
+            "currentVersion), since a same-major bump is far less likely to break the build; "
+            "only cross a major version if no same-major version fixes the issue. Avoid "
+            "pre-release versions (alpha/beta/rc) unless nothing stable remediates. "
+            "If availableVersions is empty, use the get_latest_package_version tool."
         )
 
         multi_issue_instructions = (
