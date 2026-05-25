@@ -712,8 +712,8 @@ def register_this(mcp: FastMCP) -> None:
         choices = {
             "all": {"title": f"Fix ALL {len(sorted_pkgs)} package(s)"},
             **{
-                str(idx): {"title": _package_choice_title(pkg_url, pkg_rows)}
-                for idx, (pkg_url, pkg_rows) in enumerate(sorted_pkgs, start=1)
+                pkg_url: {"title": _package_choice_title(pkg_url, pkg_rows)}
+                for pkg_url, pkg_rows in sorted_pkgs
             },
         }
         selection = await ctx.elicit(
@@ -779,11 +779,11 @@ def register_this(mcp: FastMCP) -> None:
                 "next_action_for_assistant": multi_issue_instructions,
             }
 
-        selected_index = int(selection.data) - 1
-        if selected_index < 0 or selected_index >= len(sorted_pkgs):
+        pkg_rows = pkg_map.get(selection.data)
+        if pkg_rows is None:
             raise ValueError("Invalid package selection.")
 
-        pkg_url, pkg_rows = sorted_pkgs[selected_index]
+        pkg_url = selection.data
         return {
             "report_data_url": report_data_url,
             "mode": "fix_package",
