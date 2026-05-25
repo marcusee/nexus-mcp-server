@@ -1,8 +1,7 @@
-from __future__ import annotions
+from __future__ import annotations
 
 import os
 import re
-from datetime import datetime
 from typing import Any
 from urllib.parse import urlparse
 
@@ -10,7 +9,6 @@ import httpx
 from fastmcp import Context, FastMCP
 from fastmcp.elicitation import AcceptedElicitation
 
-import inspect
 # ---------------------------------------------------------------------------
 # Configuration (set via environment variables)
 # ---------------------------------------------------------------------------
@@ -128,39 +126,6 @@ _RAW_REPORT_PATH_RE = re.compile(
 )
 
 
-def _parse_iq_datetime(dt: str | None) -> datetime:
-    """Parse Nexus IQ evaluationDate strings into a sortable datetime.
-
-    Nexus IQ commonly returns ISO-8601 strings like:
-      - 2024-03-07T15:30:43.442Z
-      - 2026-05-01T01:16:35.012+01:00
-
-    If parsing fails, returns datetime.min so those entries sort last.
-    """
-    if not dt or not isinstance(dt, str):
-        return datetime.min
-    try:
-        # Python's fromisoformat doesn't accept the trailing 'Z'.
-        return datetime.fromisoformat(dt.replace("Z", "+00:00"))
-    except ValueError:
-        return datetime.min
-
-
-def _sort_reports_newest_first(reports: list[dict]) -> list[dict]:
-    return sorted(
-        reports,
-        key=lambda r: _parse_iq_datetime(r.get("evaluationDate")),
-        reverse=True,
-    )
-
-
-def _report_choice_title(report: dict) -> str:
-    """Build a concise, user-friendly label for interactive report selection."""
-    stage = report.get("stage") or "unknown-stage"
-    evaluation_date = report.get("evaluationDate") or "unknown-date"
-    return f"stage={stage} scanned at {evaluation_date}"
-
-
 def _severity_score(issue: dict) -> float:
     """Return a numeric severity score for stable sorting."""
     try:
@@ -226,43 +191,6 @@ def _package_choice_title(package_url: str, pkg_rows: list[dict]) -> str:
     refs = ", ".join(r["issue"].get("reference") or "?" for r in pkg_rows[:3])
     extra = f" +{len(pkg_rows) - 3} more" if len(pkg_rows) > 3 else ""
     return f"[{label} {score}]  {pkg}  —  {len(pkg_rows)} CVE(s): {refs}{extra}"
-
-
-def _get_sorted_reports(application_id: str) -> list[dict]:
-    """Fetch and sort reports newest-first for one IQ application."""
-    reports = _iq_get(f"/api/v2/reports/applications/{application_id}")
-    if not isinstance(reports, list):
-        return []
-    return _sort_reports_newest_first(reports)
-
-async def _select_single_report(
-    ctx: Context,
-    reports: list[dict],
-    prompt_subject: str,
-) -> list[dict]:
-    """Prompt user to select one report when multiple are present."""
-    if len(reports) <= 1:
-        return reports
-
-    choices = {
-        str(idx): {"title": _report_choice_title(report)}
-        for idx, report in enumerate(reports, start=1)
-    }
-    print(inspect.signature(ctx.elicit))
-    print(ctx.elicit.__doc__)
-
-    selection = await ctx.elicit(
-        f"{prompt_subject} has {len(reports)} reports. Which one? ",
-        choices,
-    )
-
-    if not isinstance(selection, AcceptedElicitation):
-        raise ValueError("Report selection cancelled.")
-
-    selected_index = int(selection.data) - 1
-    if selected_index < 0 or selected_index >= len(reports):
-        raise ValueError("Invalid report selection.")
-    return [reports[selected_index]]
 
 
 def _get_latest_package_version(package_url: str) -> dict:
@@ -480,7 +408,7 @@ def register_this(mcp: FastMCP) -> None:
 
     Tools:
     - resolve_application_id   -> AA number OR publicId -> IQ applicationId(s)
-    - list_reports            -> /api/v2/reports/applications/{applicationId}
+    - list_reports            -> latest report via /api/v2/reports/applications/{applicationId}/history?limit=1
     - get_remediation_plan    -> pick one issue (or ALL) and get remediation info
     - get_latest_package_version -> latest version of a package in Nexus Repository
 
@@ -495,7 +423,7 @@ def register_this(mcp: FastMCP) -> None:
     Typical end-to-end flow (user supplies an AA number, e.g. "AA47794"):
         1. resolve_application_id("AA47794") -> user picks one application (if
            multiple) -> applications[0].applicationId
-        2. list_reports(applicationId) -> selected report (reportDataUrl)
+        2. list_reports(applicationId) -> latest report (reportDataUrl)
         3. get_remediation_plan(reportDataUrl) -> user picks one issue (or ALL)
         4. Remediate only the selected issue(s); use get_latest_package_version
            when a recommendation does not state a fixed version
@@ -638,11 +566,14 @@ def register_this(mcp: FastMCP) -> None:
         }
 
     @mcp.tool()
-    async def list_reports(ctx: Context, application_id: str) -> list:
+    async def list_reports(application_id: str) -> list:
         """
-        List all evaluation reports/scans for one Nexus IQ application.
+        Get the latest evaluation report for one Nexus IQ application.
 
-        Calls: GET /api/v2/reports/applications/{applicationId}
+        Calls: GET /api/v2/reports/applications/{applicationId}/history?limit=1
+
+        The history endpoint returns reports newest-first, so limit=1 yields the
+        single most recent scan across all stages.
 
         Args:
             application_id: The application's INTERNAL id (the `applicationId`
@@ -650,12 +581,11 @@ def register_this(mcp: FastMCP) -> None:
                 "f81a5c32544e4d55be8a0d0651dd7145"). NOT the publicId.
 
         Returns:
-            A list of report summaries. If multiple reports exist, the user is
-            prompted to manually choose one report to proceed and only the
-            selected report is returned. Each entry includes a `reportDataUrl`
-            (the path to the raw report) — pass that back into get_report or
-            get_vulnerable_components without parsing out a scan id. Typical
-            entry:
+            A single-element list holding the most recent report (empty if the
+            application has never been scanned). The entry includes a
+            `reportDataUrl` (the path to the raw report) — pass that back into
+            get_report or get_remediation_plan without parsing out a scan id.
+            Typical entry:
             {
                 "stage": "build",           # build | stage-release | release | operate | ...
                 "applicationId": "f81a5c...",
@@ -664,15 +594,18 @@ def register_this(mcp: FastMCP) -> None:
                 "reportHtmlUrl": "ui/links/application/.../report/...",
                 "embeddableReportHtmlUrl": "ui/links/application/.../report/.../embeddable",
                 "reportPdfUrl": "ui/links/application/.../report/.../pdf",
-                "reportDataUrl": "api/v2/applications/.../reports/.../raw"
+                "reportDataUrl": "api/v2/applications/.../reports/.../raw",
+                "scanId": "...",
+                "policyEvaluationId": "..."
             }
         """
-        reports = _get_sorted_reports(application_id)
-        return await _select_single_report(
-            ctx,
-            reports,
-            prompt_subject=f"Application {application_id}",
+        history = _iq_get(
+            f"/api/v2/reports/applications/{application_id}/history",
+            params={"limit": 1},
         )
+        if not isinstance(history, dict):
+            return []
+        return history.get("reports") or []
 
 
 
