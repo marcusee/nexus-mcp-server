@@ -641,7 +641,8 @@ def register_this(mcp: FastMCP) -> None:
         After calling this tool, follow these steps to remediate:
         1. Determine the safe version per package: prefer a version named in the
            package's CVE recommendationMarkdown (in `issues`), else use the
-           package's `latestVersion` (see next_action_for_assistant).
+           package's `latestVersion` — the latest version from the organization's
+           repository (see next_action_for_assistant).
         2. Apply the fix based on `directDependency` (already in `packages`):
              - direct: bump the package's version in its manifest
                (npm->package.json, maven->pom.xml, golang->go.mod,
@@ -759,8 +760,9 @@ def register_this(mcp: FastMCP) -> None:
             "(match on packageUrl). If any states a specific version "
             "(e.g. 'upgrade to >= 4.17.21' or 'use 3.2.0+'), use the highest such version. "
             "STEP B (fallback only): If no recommendationMarkdown gives a version, use the "
-            "`latestVersion` field on the package entry — it was pre-fetched for you. "
-            "Do NOT call get_latest_package_version again."
+            "`latestVersion` field on the package entry — it is the latest version from the "
+            "organization's repository, pre-fetched for you. Do NOT look up versions elsewhere; "
+            "if latestVersion is null, use the get_latest_package_version tool."
         )
 
         multi_issue_instructions = (
