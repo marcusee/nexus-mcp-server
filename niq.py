@@ -756,18 +756,17 @@ def register_this(mcp: FastMCP) -> None:
         )
 
         _VERSION_RESOLUTION = (
-            "To determine the version to upgrade a package to: "
-            "STEP A (minimum safe version): Read the recommendationMarkdown of that package's "
-            "CVEs in `issues` (match on packageUrl) for the lowest version that fixes the issue "
-            "(e.g. 'upgrade to >= 4.17.21' or 'use 3.2.0+'). "
-            "STEP B (pick from what's actually available): `availableVersions` lists the versions "
-            "in the organization's repository (newest first) — choose the version to pin from "
-            "THIS list, do NOT look up versions elsewhere. Prefer the newest version that "
-            "satisfies STEP A while keeping the package's current MAJOR version (see "
-            "currentVersion), since a same-major bump is far less likely to break the build; "
-            "only cross a major version if no same-major version fixes the issue. Avoid "
-            "pre-release versions (alpha/beta/rc) unless nothing stable remediates. "
-            "If availableVersions is empty, use the get_latest_package_version tool."
+            "To determine the version to upgrade a package to: pick the newest stable version "
+            "in `availableVersions` (which lists the org's repository, newest first). Do NOT "
+            "look up versions elsewhere. Skip pre-release versions (alpha/beta/rc) and step "
+            "down to the next entry unless nothing stable is available. If availableVersions "
+            "is empty, call get_latest_package_version and use its `latest`. "
+            "The current version is vulnerable, so breakage risk is NOT a reason to hold back "
+            "or pick something older: a major-version jump, a coordinated dependency set (e.g. "
+            "Storybook 8, React 18, Spring Boot 3), or potential peer-dependency churn are all "
+            "fine — go to latest. The recommendationMarkdown in `issues` is informational (a "
+            "floor showing what fixes the CVE); the target is still the newest in "
+            "availableVersions."
         )
 
         multi_issue_instructions = (
