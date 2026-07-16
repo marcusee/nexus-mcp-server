@@ -53,3 +53,11 @@ def rollup_all_cves(
         purl: [(origin, issue_lookup[(origin, ref)]) for origin, ref in refs]
         for purl, refs in rolled.items()
     }
+
+all_purls = {c["packageUrl"] for c in components}
+all_parent_refs = {
+    p for c in components
+    for p in ((c.get("dependencyData") or {}).get("parentComponentPurls") or [])
+}
+orphans = all_parent_refs - all_purls
+print(len(orphans), list(orphans)[:10])
