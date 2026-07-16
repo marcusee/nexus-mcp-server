@@ -61,3 +61,24 @@ all_parent_refs = {
 }
 orphans = all_parent_refs - all_purls
 print(len(orphans), list(orphans)[:10])
+
+
+
+from collections import Counter
+dupes = [p for p, n in Counter(c["packageUrl"] for c in components).items() if n > 1]
+print(len(dupes), dupes[:10])
+
+
+TARGET = "pkg:npm/your-failing-lib@x.y.z"
+
+entries = [c for c in components if c["packageUrl"] == TARGET]
+print("entries for this purl:", len(entries))
+for c in entries:
+    dep = c.get("dependencyData") or {}
+    print("  flag:", dep.get("directDependency"),
+          "| parents:", dep.get("parentComponentPurls"),
+          "| own issues:", len((c.get("securityData") or {}).get("securityIssues") or []))
+
+children = [c["packageUrl"] for c in components
+            if TARGET in ((c.get("dependencyData") or {}).get("parentComponentPurls") or [])]
+print("components listing it as parent:", children)
