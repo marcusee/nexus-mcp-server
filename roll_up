@@ -1,0 +1,55 @@
+from collections import defaultdict
+from typing import Any
+
+
+def rollup_all_cves(
+    components: list[dict[str, Any]],
+) -> dict[str, list[tuple[str, dict[str, Any]]]]:
+    """direct-dependency purl -> list of (origin_purl, issue) for itself
+    and all of its transitive descendants.
+
+    Directness comes from dependencyData.directDependency, NOT from
+    having no parents. A lib can be direct AND transitive at once."""
+    own_issues: dict[str, list[dict[str, Any]]] = {}
+    parents: dict[str, list[str]] = {}
+    direct: set[str] = set()
+
+    for c in components:
+        purl = c["packageUrl"]
+        dep = c.get("dependencyData") or {}
+        own_issues[purl] = (c.get("securityData") or {}).get("securityIssues") or []
+        parents[purl] = dep.get("parentComponentPurls") or []
+        if dep.get("directDependency"):
+            direct.add(purl)
+
+    # rolled[direct_purl] = set of (origin_purl, issue_ref)
+    rolled: defaultdict[str, set[tuple[str, str]]] = defaultdict(set)
+    issue_lookup: dict[tuple[str, str], dict[str, Any]] = {}
+
+    for purl, issues in own_issues.items():
+        if not issues:
+            continue
+
+        tagged: set[tuple[str, str]] = set()
+        for idx, i in enumerate(issues):
+            ref = i.get("reference", i.get("source", str(idx)))
+            tagged.add((purl, ref))
+            issue_lookup[(purl, ref)] = i
+
+        # walk up the full ancestor graph; credit every DIRECT node found.
+        # Includes purl itself, and does NOT stop at the first direct hit —
+        # a direct dep can also live under another direct dep.
+        stack, seen = [purl], set()
+        while stack:
+            p = stack.pop()
+            if p in seen:
+                continue
+            seen.add(p)
+            if p in direct:
+                rolled[p] |= tagged
+            stack.extend(parents.get(p, []))
+
+    return {
+        purl: [(origin, issue_lookup[(origin, ref)]) for origin, ref in refs]
+        for purl, refs in rolled.items()
+    }
